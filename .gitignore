@@ -1,0 +1,39 @@
+# Python environments and caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local secrets and environment configuration
+.env
+.env.*
+!.env.example
+
+# Source photos and generated results
+/data/
+/output/
+/outputs/
+*.cache.json
+*.cache.json.journal
+write_result_report.xlsx
+
+# Bundled third-party OCR runtime (download separately; see README.md)
+/utils/Umi-OCR_Paddle_v2.1.5/
+/utils/Umi-OCR_Rapid_v2.1.5/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+~$*
+
+# IDE and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
