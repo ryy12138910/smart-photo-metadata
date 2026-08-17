@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""Simple desktop interface for the photo metadata workflow."""
+"""Desktop interface for the photo-watermark metadata workflow."""
 
 from __future__ import print_function
 
@@ -11,48 +11,28 @@ import re
 import subprocess
 import sys
 import threading
-import urllib.error
-import urllib.request
-
-try:
-    import winreg
-except ImportError:  # pragma: no cover - non-Windows fallback
-    winreg = None
-
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
 
-PROJECT_DIR = Path(__file__).resolve().parent
-PIPELINE_SCRIPT = PROJECT_DIR / "smart_photo_metadata.py"
+PROJECT_DIR = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent
+)
+PIPELINE_SCRIPT = Path(__file__).resolve().parent / "photo_pipeline.py"
+PIPELINE_EXE = PROJECT_DIR / "PhotoMetadataWorker.exe"
 DEFAULT_DATA_DIR = PROJECT_DIR / "data"
 DEFAULT_OUTPUT_DIR = PROJECT_DIR / "outputs"
 DEFAULT_REVIEW_XLSX = DEFAULT_OUTPUT_DIR / "metadata_review.xlsx"
 DEFAULT_PHOTO_OUTPUT = DEFAULT_OUTPUT_DIR / "photos_with_exif"
-DEFAULT_LOCAL_MODEL = "qwen3-vl:4b-instruct"
-DEFAULT_CLOUD_MODEL = "gemma4:cloud"
-DEFAULT_DASHSCOPE_OCR_MODEL = "qwen3.5-ocr"
-DEFAULT_DASHSCOPE_REVIEW_MODEL = "qwen3.6-flash"
-DEFAULT_MODEL = "%s + %s" % (
-    DEFAULT_DASHSCOPE_OCR_MODEL,
-    DEFAULT_DASHSCOPE_REVIEW_MODEL,
-)
-OLLAMA_TAGS_ENDPOINT = "http://127.0.0.1:11434/api/tags"
+DEFAULT_API_ENDPOINT = "https://api.openai.com/v1/chat/completions"
+DEFAULT_API_MODEL = ""
 
 MODEL_MODE_LABELS = {
-    "百炼 API：Qwen OCR + Qwen Flash（最快，推荐）": (
-        "dashscope",
-        "suspicious",
-    ),
-    "Ollama 云端 API：仅复核异常图片（最快，推荐）": (
-        "ollama-cloud",
-        "suspicious",
-    ),
-    "Ollama 云端 API：复核所有 EXIF 不完整图片": ("ollama-cloud", "all"),
-    "本地模型：仅复核异常图片（推荐）": ("ollama", "suspicious"),
-    "本地模型：复核所有 EXIF 不完整图片": ("ollama", "all"),
-    "关闭本地模型，仅使用 OCR": ("none", "suspicious"),
+    "纯 OCR（本地处理）": ("none", "suspicious"),
+    "OCR + 大模型 API": ("openai", "suspicious"),
 }
 IMAGE_MODE_LABELS = {
     "不嵌入图片，仅保留链接（最快）": "none",
@@ -61,36 +41,34 @@ IMAGE_MODE_LABELS = {
 }
 
 
-def get_dashscope_api_key():
-    """Read the process value, then the persistent Windows user value."""
-    value = os.environ.get("DASHSCOPE_API_KEY", "").strip()
-    if value or winreg is None:
-        return value
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
-            value, _value_type = winreg.QueryValueEx(key, "DASHSCOPE_API_KEY")
-    except OSError:
-        return ""
-    return str(value).strip()
+def worker_command_prefix():
+    """Return the bundled worker or the source-mode Python command."""
+    if getattr(sys, "frozen", False):
+        return [str(PIPELINE_EXE)]
+    return [sys.executable, str(PIPELINE_SCRIPT)]
 
 
 def build_review_command(
-    python_executable,
+    command_prefix,
     image_root,
     review_xlsx,
     *,
-    model_provider="dashscope",
+    model_provider="none",
     model_review_mode="suspicious",
-    model_name=DEFAULT_MODEL,
+    model_name=DEFAULT_API_MODEL,
+    api_endpoint=DEFAULT_API_ENDPOINT,
     image_mode="thumbnail",
     path_contains="",
     max_images=0,
     group_threshold_meters=500.0,
     cancel_file="",
 ):
-    command = [
-        str(python_executable),
-        str(PIPELINE_SCRIPT),
+    prefix = (
+        list(command_prefix)
+        if isinstance(command_prefix, (list, tuple))
+        else [str(command_prefix), str(PIPELINE_SCRIPT)]
+    )
+    command = prefix + [
         "review",
         "--image-root",
         str(image_root),
@@ -105,14 +83,10 @@ def build_review_command(
         "--group-coordinate-threshold-meters",
         str(float(group_threshold_meters)),
     ]
-    if model_provider not in ("none", "dashscope"):
-        command.extend(["--llm-model", model_name.strip() or DEFAULT_MODEL])
-        command.extend(
-            [
-                "--llm-batch-size",
-                "1" if model_provider == "ollama-cloud" else "4",
-            ]
-        )
+    if model_provider == "openai":
+        command.extend(["--llm-model", model_name.strip()])
+        command.extend(["--llm-endpoint", api_endpoint.strip()])
+        command.extend(["--llm-batch-size", "1"])
     if path_contains.strip():
         command.extend(["--path-contains", path_contains.strip()])
     if int(max_images) > 0:
@@ -123,7 +97,7 @@ def build_review_command(
 
 
 def build_write_command(
-    python_executable,
+    command_prefix,
     image_root,
     review_xlsx,
     output_dir,
@@ -131,9 +105,12 @@ def build_write_command(
     dry_run=False,
     overwrite_existing_exif=False,
 ):
-    command = [
-        str(python_executable),
-        str(PIPELINE_SCRIPT),
+    prefix = (
+        list(command_prefix)
+        if isinstance(command_prefix, (list, tuple))
+        else [str(command_prefix), str(PIPELINE_SCRIPT)]
+    )
+    command = prefix + [
         "write",
         "--image-root",
         str(image_root),
@@ -147,14 +124,6 @@ def build_write_command(
     if overwrite_existing_exif:
         command.append("--overwrite-existing-exif")
     return command
-
-
-def ollama_available(timeout=1.5):
-    try:
-        with urllib.request.urlopen(OLLAMA_TAGS_ENDPOINT, timeout=timeout) as response:
-            return 200 <= response.status < 300
-    except (OSError, urllib.error.URLError):
-        return False
 
 
 def parse_progress_line(text):
@@ -194,6 +163,7 @@ class PhotoMetadataApp(tk.Tk):
         self._task_kind = ""
         self._task_output = ""
         self._task_dry_run = False
+        self._task_api_key = ""
         self._cancel_file = ""
         self._event_queue = queue.Queue()
         self._running_buttons = []
@@ -220,7 +190,10 @@ class PhotoMetadataApp(tk.Tk):
         self.review_image_root = tk.StringVar(value=str(DEFAULT_DATA_DIR))
         self.review_xlsx = tk.StringVar(value=str(DEFAULT_REVIEW_XLSX))
         self.model_mode = tk.StringVar(value=next(iter(MODEL_MODE_LABELS)))
-        self.model_name = tk.StringVar(value=DEFAULT_MODEL)
+        self.model_name = tk.StringVar(value=DEFAULT_API_MODEL)
+        self.api_endpoint = tk.StringVar(value=DEFAULT_API_ENDPOINT)
+        self.api_key = tk.StringVar(value="")
+        self.api_review_scope = tk.StringVar(value="仅复核异常结果")
         self.excel_image_mode = tk.StringVar(value=next(iter(IMAGE_MODE_LABELS)))
         self.path_contains = tk.StringVar(value="")
         self.max_images = tk.StringVar(value="0")
@@ -241,10 +214,10 @@ class PhotoMetadataApp(tk.Tk):
 
         header = ttk.Frame(container)
         header.pack(fill="x", pady=(0, 14))
-        ttk.Label(header, text="图片属性补全", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(header, text="照片水印信息整理", style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             header,
-            text="先批量完成 OCR，再用云端视觉 API 复核问题图片；人工只处理“待核”行。",
+            text="批量提取经纬度与拍摄时间，审核后写入新照片。",
             style="Subtitle.TLabel",
         ).pack(anchor="w", pady=(5, 0))
 
@@ -252,8 +225,8 @@ class PhotoMetadataApp(tk.Tk):
         self.notebook.pack(fill="both", expand=True)
         review_tab = ttk.Frame(self.notebook, padding=16)
         write_tab = ttk.Frame(self.notebook, padding=16)
-        self.notebook.add(review_tab, text="  1. 生成审核 XLSX  ")
-        self.notebook.add(write_tab, text="  2. 生成新图片  ")
+        self.notebook.add(review_tab, text="  1. 识别与审核  ")
+        self.notebook.add(write_tab, text="  2. 写入新照片  ")
         self._build_review_tab(review_tab)
         self._build_write_tab(write_tab)
 
@@ -322,7 +295,7 @@ class PhotoMetadataApp(tk.Tk):
         options.columnconfigure(1, weight=1)
         options.columnconfigure(3, weight=1)
 
-        ttk.Label(options, text="模型策略").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=5)
+        ttk.Label(options, text="识别方式").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=5)
         model_combo = ttk.Combobox(
             options,
             textvariable=self.model_mode,
@@ -332,36 +305,47 @@ class PhotoMetadataApp(tk.Tk):
         model_combo.grid(row=0, column=1, columnspan=3, sticky="ew", pady=5)
         model_combo.bind("<<ComboboxSelected>>", lambda _event: self._sync_model_state())
 
-        ttk.Label(options, text="模型名称").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=5)
-        self.model_entry = ttk.Entry(options, textvariable=self.model_name)
-        self.model_entry.grid(row=1, column=1, sticky="ew", pady=5)
+        ttk.Label(options, text="API 地址").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=5)
+        self.api_endpoint_entry = ttk.Entry(options, textvariable=self.api_endpoint)
+        self.api_endpoint_entry.grid(row=1, column=1, columnspan=3, sticky="ew", pady=5)
 
-        ttk.Label(options, text="审核表图片").grid(row=1, column=2, sticky="w", padx=(18, 10), pady=5)
+        ttk.Label(options, text="模型名称").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=5)
+        self.model_entry = ttk.Entry(options, textvariable=self.model_name)
+        self.model_entry.grid(row=2, column=1, sticky="ew", pady=5)
+
+        ttk.Label(options, text="API Key").grid(row=2, column=2, sticky="w", padx=(18, 10), pady=5)
+        self.api_key_entry = ttk.Entry(options, textvariable=self.api_key, show="●")
+        self.api_key_entry.grid(row=2, column=3, sticky="ew", pady=5)
+
+        ttk.Label(options, text="API 复核范围").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=5)
+        self.api_scope_combo = ttk.Combobox(
+            options,
+            textvariable=self.api_review_scope,
+            values=["仅复核异常结果", "复核所有缺少属性的图片"],
+            state="readonly",
+        )
+        self.api_scope_combo.grid(row=3, column=1, sticky="ew", pady=5)
+
+        ttk.Label(options, text="审核表图片").grid(row=3, column=2, sticky="w", padx=(18, 10), pady=5)
         ttk.Combobox(
             options,
             textvariable=self.excel_image_mode,
             values=list(IMAGE_MODE_LABELS),
             state="readonly",
-        ).grid(row=1, column=3, sticky="ew", pady=5)
+        ).grid(row=3, column=3, sticky="ew", pady=5)
 
-        ttk.Label(options, text="仅处理路径包含").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=5)
-        ttk.Entry(options, textvariable=self.path_contains).grid(row=2, column=1, sticky="ew", pady=5)
-        ttk.Label(options, text="最多处理图片数").grid(row=2, column=2, sticky="w", padx=(18, 10), pady=5)
-        ttk.Entry(options, textvariable=self.max_images, width=12).grid(row=2, column=3, sticky="ew", pady=5)
+        ttk.Label(options, text="路径筛选").grid(row=4, column=0, sticky="w", padx=(0, 10), pady=5)
+        ttk.Entry(options, textvariable=self.path_contains).grid(row=4, column=1, sticky="ew", pady=5)
+        ttk.Label(options, text="处理数量上限").grid(row=4, column=2, sticky="w", padx=(18, 10), pady=5)
+        ttk.Entry(options, textvariable=self.max_images, width=12).grid(row=4, column=3, sticky="ew", pady=5)
 
         ttk.Label(options, text="同目录离群阈值（米）").grid(
-            row=3, column=0, sticky="w", padx=(0, 10), pady=5
+            row=5, column=0, sticky="w", padx=(0, 10), pady=5
         )
         ttk.Entry(options, textvariable=self.group_threshold).grid(
-            row=3, column=1, sticky="ew", pady=5
+            row=5, column=1, sticky="ew", pady=5
         )
-        ttk.Label(
-            options,
-            text=(
-                "百炼模式读取 DASHSCOPE_API_KEY；建议离群阈值保持 500。"
-            ),
-            foreground="#52606D",
-        ).grid(row=3, column=2, columnspan=2, sticky="w", padx=(18, 0), pady=5)
+        self._sync_model_state()
 
         actions = ttk.Frame(parent)
         actions.pack(fill="x", pady=(14, 0))
@@ -481,18 +465,11 @@ class PhotoMetadataApp(tk.Tk):
 
     def _sync_model_state(self):
         provider, _mode = MODEL_MODE_LABELS[self.model_mode.get()]
-        self.model_entry.configure(
-            state="normal"
-            if provider in ("ollama-cloud", "ollama", "openai")
-            else "disabled"
-        )
-        current = self.model_name.get().strip()
-        if provider == "ollama-cloud" and current in ("", DEFAULT_LOCAL_MODEL):
-            self.model_name.set(DEFAULT_CLOUD_MODEL)
-        elif provider == "ollama" and current in ("", DEFAULT_CLOUD_MODEL, DEFAULT_MODEL):
-            self.model_name.set(DEFAULT_LOCAL_MODEL)
-        elif provider == "dashscope":
-            self.model_name.set(DEFAULT_MODEL)
+        state = "normal" if provider == "openai" else "disabled"
+        self.model_entry.configure(state=state)
+        self.api_endpoint_entry.configure(state=state)
+        self.api_key_entry.configure(state=state)
+        self.api_scope_combo.configure(state="readonly" if provider == "openai" else "disabled")
 
     def _choose_directory(self, variable, allow_new=False):
         current = variable.get().strip()
@@ -565,46 +542,31 @@ class PhotoMetadataApp(tk.Tk):
                 minimum=0,
             )
             provider, review_mode = MODEL_MODE_LABELS[self.model_mode.get()]
+            if provider == "openai":
+                review_mode = (
+                    "all"
+                    if self.api_review_scope.get() == "复核所有缺少属性的图片"
+                    else "suspicious"
+                )
+                if not self.api_endpoint.get().strip():
+                    raise ValueError("请输入大模型 API 地址。")
+                if not self.model_name.get().strip():
+                    raise ValueError("请输入模型名称。")
+                if not self.api_key.get().strip():
+                    raise ValueError("请输入 API Key。")
             image_mode = IMAGE_MODE_LABELS[self.excel_image_mode.get()]
         except (KeyError, ValueError) as exc:
             messagebox.showerror("参数有误", str(exc), parent=self)
             return
 
-        if provider in ("ollama", "ollama-cloud") and not ollama_available():
-            proceed = messagebox.askyesno(
-                "未检测到 Ollama",
-                (
-                    "本地模型服务 http://127.0.0.1:11434 当前不可用。\n\n"
-                    "可以先启动 Ollama 后重试；也可以继续，模型相关行将可能标记为待核。\n"
-                    "是否仍然继续？"
-                ),
-                parent=self,
-            )
-            if not proceed:
-                return
-        if provider == "dashscope":
-            dashscope_api_key = get_dashscope_api_key()
-            if not dashscope_api_key:
-                messagebox.showerror(
-                    "未读取到百炼 API Key",
-                    (
-                        "未读取到用户环境变量 DASHSCOPE_API_KEY。\n\n"
-                        "请确认 PowerShell 检测结果为 True 后重新运行。"
-                    ),
-                    parent=self,
-                )
-                return
-            # The child process inherits this value; it is never added to the
-            # command line, configuration, cache, or logs.
-            os.environ["DASHSCOPE_API_KEY"] = dashscope_api_key
-
         command = build_review_command(
-            sys.executable,
+            worker_command_prefix(),
             image_root,
             review_xlsx,
             model_provider=provider,
             model_review_mode=review_mode,
             model_name=self.model_name.get(),
+            api_endpoint=self.api_endpoint.get(),
             image_mode=image_mode,
             path_contains=self.path_contains.get(),
             max_images=max_images,
@@ -618,6 +580,7 @@ class PhotoMetadataApp(tk.Tk):
             command,
             review_xlsx,
             cancel_file=review_xlsx + ".cancel",
+            api_key=self.api_key.get() if provider == "openai" else "",
         )
 
     def _start_write(self):
@@ -663,7 +626,7 @@ class PhotoMetadataApp(tk.Tk):
                 return
 
         command = build_write_command(
-            sys.executable,
+            worker_command_prefix(),
             image_root,
             review_xlsx,
             output_dir,
@@ -684,14 +647,17 @@ class PhotoMetadataApp(tk.Tk):
         task_output,
         dry_run=False,
         cancel_file="",
+        api_key="",
     ):
-        if not PIPELINE_SCRIPT.is_file():
-            messagebox.showerror("程序不完整", "找不到 smart_photo_metadata.py。", parent=self)
+        worker_available = PIPELINE_EXE.is_file() if getattr(sys, "frozen", False) else PIPELINE_SCRIPT.is_file()
+        if not worker_available:
+            messagebox.showerror("程序不完整", "找不到后台处理程序。", parent=self)
             return
         Path(task_output).parent.mkdir(parents=True, exist_ok=True)
         self._task_kind = task_kind
         self._task_output = task_output
         self._task_dry_run = bool(dry_run)
+        self._task_api_key = str(api_key or "")
         self._cancel_file = str(cancel_file or "")
         if self._cancel_file:
             try:
@@ -721,6 +687,8 @@ class PhotoMetadataApp(tk.Tk):
         environment["PYTHONIOENCODING"] = "utf-8"
         environment["PYTHONUTF8"] = "1"
         environment["PYTHONUNBUFFERED"] = "1"
+        if self._task_api_key:
+            environment["PHOTO_METADATA_API_KEY"] = self._task_api_key
         try:
             process = subprocess.Popen(
                 command,
@@ -808,6 +776,7 @@ class PhotoMetadataApp(tk.Tk):
             button.configure(state="normal")
         self._process = None
         self._task_running = False
+        self._task_api_key = ""
         self._cancel_requested = False
         if self._cancel_file:
             try:

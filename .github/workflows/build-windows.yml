@@ -1,0 +1,29 @@
+name: Build Windows portable package
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Build portable package
+        shell: powershell
+        run: ./build_portable.ps1
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          name: PhotoMetadataTool-Windows-x64
+          path: dist/PhotoMetadataTool-Windows-x64.zip
+          if-no-files-found: error

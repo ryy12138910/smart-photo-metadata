@@ -1,15 +1,15 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""Photo metadata completion pipeline using Umi-OCR and vision APIs.
+"""Photo metadata completion pipeline using local OCR and a generic vision API.
 
 The review command scans source photos, reads existing EXIF, runs Umi-OCR,
-uses Qwen OCR and Qwen Flash only for uncertain rows, fuses the fields, and
+optionally uses an OpenAI-compatible vision API for uncertain rows, fuses the fields, and
 creates the review workbook consumed by the existing EXIF writer.
 
 Examples:
-  python smart_photo_metadata.py review --image-root data/photos \
+  python photo_pipeline.py review --image-root data/photos \
       --review-xlsx output/review.xlsx
-  python smart_photo_metadata.py write --image-root data/photos \
+  python photo_pipeline.py write --image-root data/photos \
       --review-xlsx output/review.xlsx --output-dir output/photos
 """
 
@@ -24,6 +24,7 @@ import io
 import json
 import math
 import os
+from pathlib import Path
 import re
 import statistics
 import subprocess
@@ -35,33 +36,41 @@ import urllib.request
 
 from PIL import Image
 
-import ocr_review_excel_to_exif as core
-from exif_gps_utils import validate_lat_lon
+import metadata_workbook as core
+from exif_utils import validate_lat_lon
 
 
 PIPELINE_VERSION = 3
 PROMPT_VERSION = 5
-DEFAULT_OLLAMA_ENDPOINT = "http://127.0.0.1:11434/api/chat"
-DEFAULT_OPENAI_ENDPOINT = "http://127.0.0.1:1234/v1/chat/completions"
-DEFAULT_DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_UMI_ENDPOINT = "http://127.0.0.1:1224/api/ocr"
 DEFAULT_OCR_LIMIT_SIDE_LEN = 960
-DEFAULT_LOCAL_MODEL = "qwen3-vl:4b-instruct"
-DEFAULT_CLOUD_MODEL = "gemma4:cloud"
-DEFAULT_DASHSCOPE_OCR_MODEL = "qwen3.5-ocr"
-DEFAULT_DASHSCOPE_REVIEW_MODEL = "qwen3.6-flash"
-DEFAULT_MODEL = DEFAULT_CLOUD_MODEL
-DEFAULT_UMI_EXE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "utils",
-    "Umi-OCR_Paddle_v2.1.5",
-    "Umi-OCR.exe",
-)
+DEFAULT_API_ENDPOINT = "https://api.openai.com/v1/chat/completions"
+
+
+def application_dir():
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def bundled_umi_executable():
+    runtime_dir = application_dir() / "runtime"
+    direct = runtime_dir / "Umi-OCR" / "Umi-OCR.exe"
+    if direct.is_file():
+        return str(direct)
+    if runtime_dir.is_dir():
+        matches = sorted(runtime_dir.glob("**/Umi-OCR.exe"))
+        if matches:
+            return str(matches[0])
+    return str(direct)
+
+
+DEFAULT_UMI_EXE = bundled_umi_executable()
 
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Umi-OCR + two-stage vision review + EXIF field fusion"
+        description="Local OCR + optional vision API + EXIF field fusion"
     )
     subparsers = parser.add_subparsers(dest="command")
 
@@ -75,50 +84,18 @@ def build_parser():
     review.add_argument("--umi-endpoint", default=DEFAULT_UMI_ENDPOINT)
     review.add_argument(
         "--llm-provider",
-        choices=["dashscope", "ollama-cloud", "ollama", "openai", "none"],
-        default="dashscope",
-        help=(
-            "dashscope: Umi -> Qwen OCR -> Qwen Flash two-stage review; "
-            "ollama-cloud: Ollama hosted model through the signed-in local API; "
-            "ollama/openai: local multimodal API; none: disable model assistance"
-        ),
+        choices=["openai", "none"],
+        default="none",
+        help="openai: OpenAI-compatible multimodal API; none: local OCR only",
     )
-    review.add_argument("--llm-model", default=DEFAULT_MODEL)
+    review.add_argument("--llm-model", default="")
     review.add_argument(
         "--llm-endpoint",
         default="",
-        help="defaults to Ollama :11434 or OpenAI-compatible :1234",
+        help="OpenAI-compatible chat-completions endpoint",
     )
     review.add_argument("--llm-api-key", default="")
     review.add_argument("--llm-timeout", type=int, default=180)
-    review.add_argument(
-        "--dashscope-base-url",
-        default="",
-        help=(
-            "DashScope OpenAI-compatible base URL; defaults to "
-            "DASHSCOPE_BASE_URL or the public China endpoint"
-        ),
-    )
-    review.add_argument(
-        "--dashscope-ocr-model",
-        default=DEFAULT_DASHSCOPE_OCR_MODEL,
-    )
-    review.add_argument(
-        "--dashscope-review-model",
-        default=DEFAULT_DASHSCOPE_REVIEW_MODEL,
-    )
-    review.add_argument(
-        "--dashscope-ocr-concurrency",
-        type=int,
-        default=10,
-        help="parallel Qwen OCR requests (default: 10)",
-    )
-    review.add_argument(
-        "--dashscope-review-concurrency",
-        type=int,
-        default=5,
-        help="parallel final visual-review requests (default: 5)",
-    )
     review.add_argument(
         "--api-max-retries",
         type=int,
@@ -176,7 +153,7 @@ def build_parser():
     review.add_argument(
         "--skip-ocr",
         action="store_true",
-        help="only use EXIF, filename and optional local model",
+        help="only use EXIF, filename and optional vision API",
     )
     review.add_argument(
         "--cache-file",
@@ -218,7 +195,7 @@ def build_parser():
         default=500.0,
         help=(
             "OCR coordinates farther than this from the direct-folder median "
-            "trigger local-model review"
+            "trigger vision-API review"
         ),
     )
     review.add_argument(
@@ -595,112 +572,6 @@ def model_schema():
     }
 
 
-def compact_model_schema():
-    """Small response contract used by Ollama cloud.
-
-    Ollama cloud currently does not accept the API's ``format``/JSON-schema
-    parameter. Keeping the requested JSON small also materially reduces
-    generation time on the free tier.
-    """
-    return {
-        "type": "object",
-        "properties": {
-            "latitude_text": {"type": ["string", "null"]},
-            "longitude_text": {"type": ["string", "null"]},
-            "shooting_datetime_text": {"type": ["string", "null"]},
-            "confidence": {
-                "type": "object",
-                "properties": {
-                    "latitude": {"type": "number", "minimum": 0, "maximum": 1},
-                    "longitude": {"type": "number", "minimum": 0, "maximum": 1},
-                    "shooting_datetime": {
-                        "type": "number",
-                        "minimum": 0,
-                        "maximum": 1,
-                    },
-                },
-                "required": ["latitude", "longitude", "shooting_datetime"],
-            },
-        },
-        "required": [
-            "latitude_text",
-            "longitude_text",
-            "shooting_datetime_text",
-            "confidence",
-        ],
-    }
-
-
-def compact_batch_model_schema():
-    single = compact_model_schema()
-    item_properties = {"id": {"type": "string"}}
-    item_properties.update(single["properties"])
-    return {
-        "type": "object",
-        "properties": {
-            "results": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": item_properties,
-                    "required": ["id"] + list(single["required"]),
-                },
-            }
-        },
-        "required": ["results"],
-    }
-
-
-def is_ollama_cloud(args):
-    return (
-        getattr(args, "llm_provider", "") == "ollama-cloud"
-        or clean(getattr(args, "llm_model", "")).lower().endswith(":cloud")
-        or "ollama.com" in clean(getattr(args, "llm_endpoint", "")).lower()
-    )
-
-
-def cloud_model_prompt(ocr_text, args):
-    return (
-        "只读取图片像素中明确可见的水印，逐字转写纬度、经度和拍摄日期/时间。"
-        "不要根据地点、文件名或常识猜测；看不清就返回 null。"
-        "保留水印原格式，不要换算坐标。"
-        "下面的 OCR 仅供交叉检查，可能错误，图片像素优先。"
-        "\n预期纬度 %.6f~%.6f，经度 %.6f~%.6f；范围只用于发现 OCR 错误。"
-        "\nOCR：\n%s"
-        % (
-            args.expected_lat_min,
-            args.expected_lat_max,
-            args.expected_lon_min,
-            args.expected_lon_max,
-            ocr_text or "(empty)",
-        )
-    )
-
-
-def normalize_compact_model_result(result):
-    """Fill the evidence/notes fields expected by the existing merger."""
-    if not isinstance(result, dict):
-        raise RuntimeError("cloud model result is not a JSON object")
-    normalized = dict(result)
-    confidence = normalized.get("confidence")
-    if not isinstance(confidence, dict):
-        confidence = {}
-    evidence = {}
-    for text_key, confidence_key in (
-        ("latitude_text", "latitude"),
-        ("longitude_text", "longitude"),
-        ("shooting_datetime_text", "shooting_datetime"),
-    ):
-        value = normalized.get(text_key)
-        evidence[confidence_key] = clean(value)
-        if confidence_key not in confidence:
-            confidence[confidence_key] = 0.9 if clean(value) else 0.0
-    normalized["confidence"] = confidence
-    normalized["evidence"] = evidence
-    normalized.setdefault("notes", "Ollama 云端视觉模型直接读取图片水印")
-    return normalized
-
-
 def model_prompt(ocr_text, args):
     return (
         "\u4f60\u662f\u56fe\u7247\u6c34\u5370\u5b57\u6bb5\u6821\u5bf9\u5668\u3002"
@@ -777,171 +648,10 @@ def extract_json_object(value):
         raise RuntimeError("model API did not return JSON: %s" % text[:300])
 
 
-def dashscope_credentials(args):
-    api_key = clean(getattr(args, "llm_api_key", "")) or clean(
-        os.environ.get("DASHSCOPE_API_KEY")
-    )
-    base_url = clean(getattr(args, "dashscope_base_url", "")) or clean(
-        os.environ.get("DASHSCOPE_BASE_URL")
-    )
-    base_url = base_url or DEFAULT_DASHSCOPE_BASE_URL
-    if not api_key:
-        raise RuntimeError(
-            "未找到 DASHSCOPE_API_KEY；请配置用户环境变量后重新启动程序"
-        )
-    endpoint = base_url.rstrip("/")
-    if not endpoint.endswith("/chat/completions"):
-        endpoint += "/chat/completions"
-    return api_key, endpoint
-
-
-def dashscope_usage(response):
-    usage = response.get("usage") or {}
-    return {
-        "input_tokens": int(
-            usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0
-        ),
-        "output_tokens": int(
-            usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0
-        ),
-    }
-
-
-def dashscope_model_prompt(work, args, final_review=False):
-    ocr_text = clean(work.get("ocr_text"))
-    if final_review:
-        first_result = work.get("dashscope_ocr_result") or {}
-        return (
-            "你是图片水印的最终视觉复核器。必须直接查看图片像素，"
-            "只转写明确可见的纬度、经度和拍摄日期/时间；不得根据地点或范围猜测。"
-            "请核对 Umi-OCR 与专用 OCR 模型的冲突，看不清的字段返回 null。"
-            "如果图片同时显示日期和时分，必须返回完整日期时间；"
-            "如果图片只显示日期，只返回日期，禁止补写 00:00:00；"
-            "如果图片没有日期，日期时间必须返回 null。"
-            "坐标保留图片原文，不换算十进制度。输出且只输出 JSON。"
-            "\n预期纬度 %.6f~%.6f，经度 %.6f~%.6f；范围仅用于发现错误。"
-            "\nUmi-OCR：\n%s"
-            "\n专用 OCR 结果：\n%s"
-            "\nJSON字段：latitude_text、longitude_text、shooting_datetime_text、"
-            "confidence（包含latitude、longitude、shooting_datetime，值0~1）。"
-            % (
-                args.expected_lat_min,
-                args.expected_lat_max,
-                args.expected_lon_min,
-                args.expected_lon_max,
-                ocr_text or "(empty)",
-                json.dumps(first_result, ensure_ascii=False),
-            )
-        )
-    return (
-        "你是专用图片文字提取器。直接读取图片水印中的纬度、经度和拍摄日期/时间。"
-        "下面的 Umi-OCR 可能有错，只能作为定位提示，必须以图片像素为准。"
-        "不要根据地点、范围或常识猜测；看不清的字段返回 null。"
-        "如果图片同时显示日期和时分，必须返回完整日期时间；"
-        "如果图片只显示日期，只返回日期，禁止补写 00:00:00；"
-        "如果图片没有日期，日期时间必须返回 null。"
-        "坐标保留水印原文，不换算十进制度。输出且只输出 JSON。"
-        "\n预期纬度 %.6f~%.6f，经度 %.6f~%.6f；范围仅用于发现错误。"
-        "\nUmi-OCR：\n%s"
-        "\nJSON字段：latitude_text、longitude_text、shooting_datetime_text、"
-        "confidence（包含latitude、longitude、shooting_datetime，值0~1）。"
-        % (
-            args.expected_lat_min,
-            args.expected_lat_max,
-            args.expected_lon_min,
-            args.expected_lon_max,
-            ocr_text or "(empty)",
-        )
-    )
-
-
-def call_dashscope_model(work, args, model_name, final_review=False):
-    api_key, endpoint = dashscope_credentials(args)
-    data_url = image_data_url(work["image_path"])
-    payload = {
-        "model": model_name,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": data_url},
-                    },
-                    {
-                        "type": "text",
-                        "text": dashscope_model_prompt(
-                            work,
-                            args,
-                            final_review=final_review,
-                        ),
-                    },
-                ],
-            }
-        ],
-        "response_format": {"type": "json_object"},
-        "enable_thinking": False,
-        "temperature": 0,
-        "max_tokens": 500,
-        "stream": False,
-    }
-    started = time.perf_counter()
-    response = http_json_with_retry(
-        endpoint,
-        payload,
-        args.llm_timeout,
-        headers={"Authorization": "Bearer " + api_key},
-        max_retries=args.api_max_retries,
-    )
-    elapsed = time.perf_counter() - started
-    choices = response.get("choices") or []
-    if not choices:
-        raise RuntimeError("DashScope API returned no choices")
-    content = (choices[0].get("message") or {}).get("content")
-    result = normalize_compact_model_result(extract_json_object(content))
-    result["notes"] = "百炼视觉模型直接读取图片水印"
-    return result, dashscope_usage(response), elapsed
-
-
-def call_local_model(image_path, ocr_text, args):
+def call_vision_api(image_path, ocr_text, args):
     data_url = image_data_url(image_path)
     prompt = model_prompt(ocr_text, args)
-    endpoint = args.llm_endpoint
-    if args.llm_provider in ("ollama", "ollama-cloud"):
-        endpoint = endpoint or DEFAULT_OLLAMA_ENDPOINT
-        cloud = is_ollama_cloud(args)
-        schema = compact_model_schema() if cloud else model_schema()
-        request_prompt = cloud_model_prompt(ocr_text, args) if cloud else prompt
-        payload = {
-            "model": args.llm_model,
-            "stream": False,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "\u4e25\u683c\u6309 JSON schema \u8f93\u51fa\uff0c\u4e0d\u8981\u8f93\u51fa\u989d\u5916\u6587\u5b57\u3002",
-                },
-                {
-                    "role": "user",
-                    "content": request_prompt
-                    + "\nJSON schema:\n"
-                    + json.dumps(schema, ensure_ascii=False),
-                    "images": [data_url.split(",", 1)[1]],
-                },
-            ],
-            "options": {"temperature": 0},
-        }
-        if cloud:
-            payload["think"] = False
-        else:
-            payload["format"] = schema
-        headers = {}
-        if getattr(args, "llm_api_key", ""):
-            headers["Authorization"] = "Bearer " + args.llm_api_key
-        response = http_json(endpoint, payload, args.llm_timeout, headers=headers)
-        result = extract_json_object((response.get("message") or {}).get("content"))
-        return normalize_compact_model_result(result) if cloud else result
-
-    endpoint = endpoint or DEFAULT_OPENAI_ENDPOINT
+    endpoint = clean(args.llm_endpoint) or DEFAULT_API_ENDPOINT
     headers = {}
     if args.llm_api_key:
         headers["Authorization"] = "Bearer " + args.llm_api_key
@@ -962,10 +672,16 @@ def call_local_model(image_path, ocr_text, args):
             },
         ],
     }
-    response = http_json(endpoint, payload, args.llm_timeout, headers=headers)
+    response = http_json_with_retry(
+        endpoint,
+        payload,
+        args.llm_timeout,
+        headers=headers,
+        max_retries=args.api_max_retries,
+    )
     choices = response.get("choices") or []
     if not choices:
-        raise RuntimeError("local OpenAI-compatible API returned no choices")
+        raise RuntimeError("OpenAI-compatible API returned no choices")
     return extract_json_object((choices[0].get("message") or {}).get("content"))
 
 
@@ -1043,14 +759,14 @@ def parse_batch_model_response(value, batch):
     return mapped
 
 
-def call_local_model_batch(batch, args):
+def call_vision_api_batch(batch, args):
     """Review multiple problem images in one multimodal request."""
     if not batch:
         return {}
     if len(batch) == 1:
         work = batch[0]
         return {
-            work["batch_id"]: call_local_model(
+            work["batch_id"]: call_vision_api(
                 work["image_path"],
                 work["ocr_text"],
                 args,
@@ -1059,52 +775,7 @@ def call_local_model_batch(batch, args):
 
     data_urls = [image_data_url(work["image_path"]) for work in batch]
     prompt = batch_model_prompt(batch, args)
-    endpoint = args.llm_endpoint
-    if args.llm_provider in ("ollama", "ollama-cloud"):
-        endpoint = endpoint or DEFAULT_OLLAMA_ENDPOINT
-        cloud = is_ollama_cloud(args)
-        schema = compact_batch_model_schema() if cloud else batch_model_schema()
-        if cloud:
-            prompt = (
-                batch_model_prompt(batch, args)
-                + "\n仅返回经纬度、时间及各字段置信度，不要重复证据或说明。"
-            )
-        payload = {
-            "model": args.llm_model,
-            "stream": False,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "严格按 JSON schema 输出，不要输出额外文字。",
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                    + "\nJSON schema:\n"
-                    + json.dumps(schema, ensure_ascii=False),
-                    "images": [value.split(",", 1)[1] for value in data_urls],
-                },
-            ],
-            "options": {"temperature": 0},
-        }
-        if cloud:
-            payload["think"] = False
-        else:
-            payload["format"] = schema
-        headers = {}
-        if getattr(args, "llm_api_key", ""):
-            headers["Authorization"] = "Bearer " + args.llm_api_key
-        response = http_json(endpoint, payload, args.llm_timeout, headers=headers)
-        content = (response.get("message") or {}).get("content")
-        mapped = parse_batch_model_response(content, batch)
-        if cloud:
-            return {
-                result_id: normalize_compact_model_result(result)
-                for result_id, result in mapped.items()
-            }
-        return mapped
-
-    endpoint = endpoint or DEFAULT_OPENAI_ENDPOINT
+    endpoint = clean(args.llm_endpoint) or DEFAULT_API_ENDPOINT
     headers = {}
     if args.llm_api_key:
         headers["Authorization"] = "Bearer " + args.llm_api_key
@@ -1135,10 +806,16 @@ def call_local_model_batch(batch, args):
             {"role": "user", "content": content},
         ],
     }
-    response = http_json(endpoint, payload, args.llm_timeout, headers=headers)
+    response = http_json_with_retry(
+        endpoint,
+        payload,
+        args.llm_timeout,
+        headers=headers,
+        max_retries=args.api_max_retries,
+    )
     choices = response.get("choices") or []
     if not choices:
-        raise RuntimeError("local OpenAI-compatible API returned no choices")
+        raise RuntimeError("OpenAI-compatible API returned no choices")
     return parse_batch_model_response(
         (choices[0].get("message") or {}).get("content"),
         batch,
@@ -1250,18 +927,11 @@ def check_cancelled(args):
 
 def review_result_cache_key(args):
     """Key all options that can change a preliminary merged review row."""
-    if getattr(args, "llm_provider", "") == "dashscope":
-        model_value = "%s+%s" % (
-            args.dashscope_ocr_model,
-            args.dashscope_review_model,
-        )
-    else:
-        model_value = args.llm_model
     values = {
         "pipeline": PIPELINE_VERSION,
         "prompt": PROMPT_VERSION,
         "provider": args.llm_provider,
-        "model": model_value,
+        "model": args.llm_model,
         "review_mode": args.llm_review_mode,
         "llm_min_confidence": args.llm_min_confidence,
         "auto_approve_threshold": args.auto_approve_threshold,
@@ -1283,271 +953,9 @@ def model_batch_id(relative_path):
     return "img_" + digest[:16]
 
 
-def dashscope_result_needs_final_review(work, result, args):
-    reasons = []
-    if not isinstance(result, dict):
-        return ["专用 OCR 未返回有效结果"]
-
-    latitude = valid_model_coordinate(
-        model_text_value(result, "latitude_text", "latitude"),
-        "lat",
-        args,
-    )
-    longitude = valid_model_coordinate(
-        model_text_value(result, "longitude_text", "longitude"),
-        "lon",
-        args,
-    )
-    raw_shooting_time = model_text_value(
-        result,
-        "shooting_datetime_text",
-        "shooting_datetime",
-    )
-    shooting_time, shooting_time_has_clock = datetime_with_visible_precision(
-        raw_shooting_time
-    )
-    if latitude is None:
-        reasons.append("纬度缺失或越界")
-    if longitude is None:
-        reasons.append("经度缺失或越界")
-    if not shooting_time:
-        reasons.append("拍摄时间缺失")
-    elif not shooting_time_has_clock:
-        reasons.append("专用 OCR 仅识别到日期，需确认原图是否显示时分")
-    for field, label in (
-        ("latitude", "纬度"),
-        ("longitude", "经度"),
-        ("shooting_datetime", "拍摄时间"),
-    ):
-        if confidence_value(result, field) < 0.75:
-            reasons.append("%s置信度低" % label)
-
-    umi = parse_ocr_fields(work.get("ocr_text"), args)
-    if latitude is not None and umi["lat"] is not None:
-        if abs(float(latitude) - float(umi["lat"])) > 0.0005:
-            reasons.append("纬度与 Umi-OCR 冲突")
-    if longitude is not None and umi["lon"] is not None:
-        if abs(float(longitude) - float(umi["lon"])) > 0.0005:
-            reasons.append("经度与 Umi-OCR 冲突")
-    if shooting_time and umi["time"]:
-        if date_part(shooting_time) != date_part(umi["time"]):
-            reasons.append("日期与 Umi-OCR 冲突")
-    return list(dict.fromkeys(reasons))
-
-
-def review_dashscope_pipeline(pending, args, cache, model_cache_key, counts):
-    """Run Qwen OCR concurrently, then send only unresolved rows to Qwen Flash."""
-    if not pending:
-        return
-    if not (1 <= int(args.dashscope_ocr_concurrency) <= 64):
-        raise ValueError("--dashscope-ocr-concurrency must be between 1 and 64")
-    if not (1 <= int(args.dashscope_review_concurrency) <= 32):
-        raise ValueError("--dashscope-review-concurrency must be between 1 and 32")
-    # Fail before creating worker threads if the key is unavailable.
-    dashscope_credentials(args)
-
-    ocr_key = "%s:dashscope:%s" % (
-        PROMPT_VERSION,
-        args.dashscope_ocr_model,
-    )
-    review_key = "%s:dashscope:%s" % (
-        PROMPT_VERSION,
-        args.dashscope_review_model,
-    )
-    total = len(pending)
-
-    def run_stage(jobs, model_name, concurrency, cache_field, stage_name, final_review):
-        if not jobs:
-            return
-        completed = 0
-        with ThreadPoolExecutor(max_workers=int(concurrency)) as executor:
-            futures = {
-                executor.submit(
-                    call_dashscope_model,
-                    work,
-                    args,
-                    model_name,
-                    final_review,
-                ): work
-                for work in jobs
-            }
-            for future in as_completed(futures):
-                work = futures[future]
-                result = None
-                error = ""
-                usage = {"input_tokens": 0, "output_tokens": 0}
-                elapsed = 0.0
-                try:
-                    result, usage, elapsed = future.result()
-                except Exception as exc:
-                    error = clean(exc)
-                work["item"][cache_field] = {
-                    "key": review_key if final_review else ocr_key,
-                    "result": result,
-                    "error": error,
-                    "usage": usage,
-                    "elapsed_seconds": round(elapsed, 3),
-                }
-                cache.save(work["relative"])
-                completed += 1
-                counts["model"] += 1
-                counts["api_input_tokens"] += usage["input_tokens"]
-                counts["api_output_tokens"] += usage["output_tokens"]
-                if final_review:
-                    counts["qwen_review_calls"] += 1
-                    counts["qwen_review_seconds"] += elapsed
-                    counts["qwen_review_input_tokens"] += usage["input_tokens"]
-                    counts["qwen_review_output_tokens"] += usage["output_tokens"]
-                else:
-                    counts["qwen_ocr_calls"] += 1
-                    counts["qwen_ocr_seconds"] += elapsed
-                    counts["qwen_ocr_input_tokens"] += usage["input_tokens"]
-                    counts["qwen_ocr_output_tokens"] += usage["output_tokens"]
-                print(
-                    "[%s %d/%d] %s（%.2f 秒）"
-                    % (
-                        stage_name,
-                        completed,
-                        len(jobs),
-                        work["relative"],
-                        elapsed,
-                    ),
-                    flush=True,
-                )
-                check_cancelled(args)
-
-    ocr_jobs = []
-    for work in pending:
-        cached = work["item"].get("dashscope_ocr")
-        if (
-            not args.refresh_model
-            and isinstance(cached, dict)
-            and cached.get("key") == ocr_key
-            and isinstance(cached.get("result"), dict)
-            and not clean(cached.get("error"))
-        ):
-            continue
-        ocr_jobs.append(work)
-    run_stage(
-        ocr_jobs,
-        args.dashscope_ocr_model,
-        args.dashscope_ocr_concurrency,
-        "dashscope_ocr",
-        "qwen-ocr",
-        False,
-    )
-
-    final_candidates = []
-    for work in pending:
-        checkpoint = work["item"].get("dashscope_ocr") or {}
-        work["dashscope_ocr_result"] = checkpoint.get("result")
-        work["dashscope_ocr_error"] = clean(checkpoint.get("error"))
-        reasons = dashscope_result_needs_final_review(
-            work,
-            work["dashscope_ocr_result"],
-            args,
-        )
-        if work["dashscope_ocr_error"]:
-            reasons.insert(0, "专用 OCR API 失败")
-        work["dashscope_review_reasons"] = list(dict.fromkeys(reasons))
-        if reasons:
-            final_candidates.append(work)
-
-    final_jobs = []
-    for work in final_candidates:
-        cached = work["item"].get("dashscope_review")
-        if (
-            not args.refresh_model
-            and isinstance(cached, dict)
-            and cached.get("key") == review_key
-            and isinstance(cached.get("result"), dict)
-            and not clean(cached.get("error"))
-        ):
-            continue
-        final_jobs.append(work)
-    print(
-        "[qwen route] 专用 OCR 共 %d 张，其中 %d 张进入最终视觉复核"
-        % (total, len(final_candidates)),
-        flush=True,
-    )
-    run_stage(
-        final_jobs,
-        args.dashscope_review_model,
-        args.dashscope_review_concurrency,
-        "dashscope_review",
-        "qwen-review",
-        True,
-    )
-
-    for work in pending:
-        ocr_checkpoint = work["item"].get("dashscope_ocr") or {}
-        review_checkpoint = work["item"].get("dashscope_review") or {}
-        final_required = bool(work.get("dashscope_review_reasons"))
-        final_result = review_checkpoint.get("result") if final_required else None
-        ocr_result = ocr_checkpoint.get("result")
-        result = final_result if isinstance(final_result, dict) else ocr_result
-        errors = []
-        if clean(ocr_checkpoint.get("error")):
-            errors.append("Qwen OCR: " + clean(ocr_checkpoint.get("error")))
-        if final_required and clean(review_checkpoint.get("error")):
-            errors.append(
-                "Qwen Flash: " + clean(review_checkpoint.get("error"))
-            )
-        if final_required and not isinstance(final_result, dict):
-            errors.append(
-                "最终视觉复核未完成：" + "、".join(
-                    work.get("dashscope_review_reasons") or []
-                )
-            )
-        error = "; ".join(dict.fromkeys(errors))
-        work["model_result"] = result
-        work["model_error"] = error
-        work["item"]["model"] = {
-            "key": model_cache_key,
-            "result": result,
-            "error": error,
-        }
-        cache.save(work["relative"])
-        if not isinstance(result, dict):
-            counts["model_error"] += 1
-
-    # Prices for the China deployment, per million tokens, in CNY.
-    cost = (
-        counts["qwen_ocr_input_tokens"] * 0.5
-        + counts["qwen_ocr_output_tokens"] * 2.0
-        + counts["qwen_review_input_tokens"] * 1.2
-        + counts["qwen_review_output_tokens"] * 7.2
-    ) / 1000000.0
-    counts["api_cost_cny"] = cost
-    print(
-        "[api stats] Qwen OCR=%d 次（均值 %.2f 秒），"
-        "Qwen Flash=%d 次（均值 %.2f 秒），Token=%d入/%d出，"
-        "预估费用=CNY %.4f"
-        % (
-            counts["qwen_ocr_calls"],
-            counts["qwen_ocr_seconds"] / max(1, counts["qwen_ocr_calls"]),
-            counts["qwen_review_calls"],
-            counts["qwen_review_seconds"] / max(1, counts["qwen_review_calls"]),
-            counts["api_input_tokens"],
-            counts["api_output_tokens"],
-            counts["api_cost_cny"],
-        ),
-        flush=True,
-    )
-
-
 def review_model_batches(pending, args, cache, model_cache_key, counts):
     """Resolve model work in batches, splitting failed batches down to singles."""
     if not pending:
-        return
-    if getattr(args, "llm_provider", "") == "dashscope":
-        review_dashscope_pipeline(
-            pending,
-            args,
-            cache,
-            model_cache_key,
-            counts,
-        )
         return
     batch_size = int(args.llm_batch_size)
     if batch_size < 1 or batch_size > 16:
@@ -1576,7 +984,7 @@ def review_model_batches(pending, args, cache, model_cache_key, counts):
         check_cancelled(args)
         counts["model"] += 1
         try:
-            mapped = call_local_model_batch(batch, args)
+            mapped = call_vision_api_batch(batch, args)
         except Exception as exc:
             if isinstance(exc, TaskCancelled):
                 raise
@@ -1752,10 +1160,10 @@ def merge_fields(image_path, exif, ocr_text, model_result, model_error, args):
                 candidate = valid_model_coordinate(raw_value, kind, args)
             except Exception as exc:
                 candidate = None
-                tips.append("invalid local-model %s: %s" % (target, exc))
+                tips.append("invalid vision-API %s: %s" % (target, exc))
             if raw_value not in (None, "") and candidate is None:
                 tips.append(
-                    "local-model %s is invalid or outside expected range and was discarded"
+                    "vision-API %s is invalid or outside expected range and was discarded"
                     % target
                 )
             model_coordinates[target] = candidate
@@ -1785,11 +1193,11 @@ def merge_fields(image_path, exif, ocr_text, model_result, model_error, args):
                         % (target, values[target], candidate)
                     )
                 else:
-                    tips.append("local model agrees with EXIF %s" % target)
+                    tips.append("vision API agrees with EXIF %s" % target)
                 continue
 
             values[target] = candidate
-            sources[target] = "local model"
+            sources[target] = "大模型 API"
             confidence[target] = model_conf
             has_evidence = bool(evidence)
             trusted[target] = bool(
@@ -1798,12 +1206,12 @@ def merge_fields(image_path, exif, ocr_text, model_result, model_error, args):
 
             if not has_evidence:
                 tips.append(
-                    "local-model %s candidate filled but visible evidence is missing"
+                    "vision-API %s candidate filled but visible evidence is missing"
                     % target
                 )
             if model_conf < args.llm_min_confidence:
                 tips.append(
-                    "local-model %s confidence is very low (%.2f); candidate filled for review"
+                    "vision-API %s confidence is very low (%.2f); candidate filled for review"
                     % (target, model_conf)
                 )
 
@@ -1813,7 +1221,7 @@ def merge_fields(image_path, exif, ocr_text, model_result, model_error, args):
                     sources[target] += "+OCR agrees"
                 else:
                     tips.append(
-                        "local model overrode OCR %s: OCR %.8f -> model %.8f"
+                        "vision API overrode OCR %s: OCR %.8f -> model %.8f"
                         % (target, float(ocr_candidate), float(candidate))
                     )
 
@@ -1827,7 +1235,7 @@ def merge_fields(image_path, exif, ocr_text, model_result, model_error, args):
                         % (values["time"], model_time)
                     )
                 else:
-                    tips.append("local model agrees with EXIF date")
+                    tips.append("vision API agrees with EXIF date")
             else:
                 ocr_has_more_precise_time = bool(
                     ocr["time"]
@@ -1852,7 +1260,7 @@ def merge_fields(image_path, exif, ocr_text, model_result, model_error, args):
                     )
                 else:
                     values["time"] = model_time
-                    sources["time"] = "local model"
+                    sources["time"] = "大模型 API"
                     confidence["time"] = model_time_conf
                     trusted["time"] = bool(
                         model_time_evidence
@@ -1860,11 +1268,11 @@ def merge_fields(image_path, exif, ocr_text, model_result, model_error, args):
                     )
                 if not model_time_evidence:
                     tips.append(
-                        "local-model date candidate filled but visible evidence is missing"
+                        "vision-API date candidate filled but visible evidence is missing"
                     )
                 if model_time_conf < args.llm_min_confidence:
                     tips.append(
-                        "local-model date confidence is very low (%.2f); candidate filled for review"
+                        "vision-API date confidence is very low (%.2f); candidate filled for review"
                         % model_time_conf
                     )
                 if ocr["time"]:
@@ -1872,7 +1280,7 @@ def merge_fields(image_path, exif, ocr_text, model_result, model_error, args):
                         sources["time"] += "+OCR agrees"
                     else:
                         tips.append(
-                            "local model overrode OCR date: OCR %s -> model %s"
+                            "vision API overrode OCR date: OCR %s -> model %s"
                             % (ocr["time"], model_time)
                         )
 
@@ -2093,13 +1501,7 @@ def create_review(args):
     if not image_paths:
         raise ValueError("no supported images found: %s" % image_root)
 
-    if args.llm_provider == "dashscope":
-        model_descriptor = "%s+%s" % (
-            args.dashscope_ocr_model,
-            args.dashscope_review_model,
-        )
-    else:
-        model_descriptor = args.llm_model
+    model_descriptor = args.llm_model
     print(
         "Smart review: images=%d, llm=%s/%s, cache=%s"
         % (len(image_paths), args.llm_provider, model_descriptor, cache.path)
@@ -2113,17 +1515,6 @@ def create_review(args):
         "exif": 0,
         "ocr_error": 0,
         "model_error": 0,
-        "api_input_tokens": 0,
-        "api_output_tokens": 0,
-        "qwen_ocr_calls": 0,
-        "qwen_review_calls": 0,
-        "qwen_ocr_seconds": 0.0,
-        "qwen_review_seconds": 0.0,
-        "qwen_ocr_input_tokens": 0,
-        "qwen_ocr_output_tokens": 0,
-        "qwen_review_input_tokens": 0,
-        "qwen_review_output_tokens": 0,
-        "api_cost_cny": 0.0,
     }
     model_cache_key = "%s:%s:%s" % (
         PROMPT_VERSION,
@@ -2459,15 +1850,15 @@ def create_review(args):
                 and "\u7eac\u5ea6=EXIF" in source_text
             )
             coordinates_from_model = (
-                "\u7ecf\u5ea6=local model" in source_text
-                and "\u7eac\u5ea6=local model" in source_text
+                "\u7ecf\u5ea6=大模型 API" in source_text
+                and "\u7eac\u5ea6=大模型 API" in source_text
             )
             if coordinates_from_exif or coordinates_from_model:
                 continue
 
             distance_tip = (
                 "folder coordinate outlier: %.0f m from direct-folder median; "
-                "local-model review triggered"
+                "vision-API review triggered"
             ) % outlier["distance"]
             print(
                 "[folder check] %s -> %.0f m outlier"
@@ -2477,8 +1868,8 @@ def create_review(args):
 
             if args.llm_provider == "none":
                 append_record_tip(record, distance_tip.replace(
-                    "local-model review triggered",
-                    "local model disabled; human review required",
+                    "vision-API review triggered",
+                    "vision API disabled; human review required",
                 ))
                 force_human_review(record)
                 continue
@@ -2604,6 +1995,16 @@ def main(argv=None):
     args.image_root = os.path.abspath(args.image_root)
     args.review_xlsx = os.path.abspath(args.review_xlsx)
     if args.command == "review":
+        args.llm_api_key = clean(args.llm_api_key) or clean(
+            os.environ.get("PHOTO_METADATA_API_KEY")
+        )
+        if args.llm_provider == "openai":
+            if not clean(args.llm_endpoint):
+                raise ValueError("大模型 API 地址不能为空")
+            if not clean(args.llm_model):
+                raise ValueError("大模型名称不能为空")
+            if not args.llm_api_key:
+                raise ValueError("大模型 API Key 不能为空")
         try:
             return create_review(args)
         except TaskCancelled as exc:

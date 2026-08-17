@@ -1,26 +1,17 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""Create an OCR review Excel file, then write reviewed GPS/time EXIF to JPGs.
-
-Workflow:
-1. MODE = "MAKE_REVIEW": OCR CSV -> review Excel with embedded photos.
-2. Review in Excel. Change "审核结果" from "未审" to "通过" for rows to write.
-3. MODE = "WRITE_EXIF": reviewed Excel -> copied JPGs with GPS/time EXIF.
-"""
+"""Review-workbook generation and approved EXIF-writing helpers."""
 
 from __future__ import print_function
 
-import argparse
-import csv
 from datetime import datetime
 import hashlib
 import os
 import re
 import shutil
-import sys
 import tempfile
 
-from exif_gps_utils import (
+from exif_utils import (
     copy_output_path,
     load_exif_dict,
     read_gps_exif,
@@ -31,48 +22,14 @@ from exif_gps_utils import (
 )
 
 
-# =========================
-# VSCode direct-run config
-# =========================
-USE_VSCODE_CONFIG = True
+# Global defaults keep the program usable for projects in any region.
+EXPECTED_LAT_MIN = -90.0
+EXPECTED_LAT_MAX = 90.0
+EXPECTED_LON_MIN = -180.0
+EXPECTED_LON_MAX = 180.0
 
-# MAKE_REVIEW: OCR CSV -> Excel review workbook.
-# WRITE_EXIF: reviewed Excel workbook -> copied JPGs with EXIF.
-MODE = "WRITE_EXIF"
-
-# Folder containing source photos. The script searches recursively.
-IMAGE_ROOT_DIR = r"D:\斜塘_p3"
-
-# OCR CSV exported by your OCR software.
-OCR_CSV_PATH = r"D:\斜塘_p3_result\[OCR]_10幢_20260727_0852.csv"
-
-# Review workbook to create/read.
-REVIEW_XLSX_PATH = r"D:\斜塘_p3_result\(OCR)_review.xlsx"
-
-# Output folder for copied photos and result files when MODE = "WRITE_EXIF".
-OUTPUT_DIR = r"D:\斜塘_p3_result\reviewed_exif_output"
-
-# First write run can use DRY_RUN=True to generate only the result report.
-DRY_RUN = False
-IN_PLACE = False
-
-# Optional CSV column names. Leave empty to auto-detect.
-CSV_IMAGE_NAME_COLUMN = ""
-CSV_IMAGE_PATH_COLUMN = ""
-CSV_OCR_TEXT_COLUMN = ""
-
-# Coordinate range check for this project:
-# E 120d38'06" ~ 120d51'37"; N 31d14'01" ~ 31d26'10".
-EXPECTED_LAT_MIN = 31.2336111111
-EXPECTED_LAT_MAX = 31.4361111111
-EXPECTED_LON_MIN = 120.635
-EXPECTED_LON_MAX = 120.8602777778
-
-# Embed compressed previews in Excel by default. Original files stay untouched
-# and remain accessible through the photo hyperlink.
 PHOTO_DISPLAY_MAX_WIDTH = 520
 PHOTO_DISPLAY_MAX_HEIGHT = 320
-EXCEL_IMAGE_MODE = "thumbnail"
 THUMBNAIL_QUALITY = 70
 
 
@@ -130,71 +87,14 @@ PROJECT_LON_MIN = 119.0
 PROJECT_LON_MAX = 122.0
 
 
-def vscode_config_argv():
-    argv = [MODE]
-    argv.extend(["--image-root", IMAGE_ROOT_DIR])
-    argv.extend(["--review-xlsx", REVIEW_XLSX_PATH])
-    argv.extend(["--output-dir", OUTPUT_DIR])
-    argv.extend(["--expected-lat-min", str(EXPECTED_LAT_MIN)])
-    argv.extend(["--expected-lat-max", str(EXPECTED_LAT_MAX)])
-    argv.extend(["--expected-lon-min", str(EXPECTED_LON_MIN)])
-    argv.extend(["--expected-lon-max", str(EXPECTED_LON_MAX)])
-    argv.extend(["--photo-display-max-width", str(PHOTO_DISPLAY_MAX_WIDTH)])
-    argv.extend(["--photo-display-max-height", str(PHOTO_DISPLAY_MAX_HEIGHT)])
-    argv.extend(["--excel-image-mode", EXCEL_IMAGE_MODE])
-    argv.extend(["--thumbnail-quality", str(THUMBNAIL_QUALITY)])
-    if OCR_CSV_PATH:
-        argv.extend(["--ocr-csv", OCR_CSV_PATH])
-    if DRY_RUN:
-        argv.append("--dry-run")
-    if IN_PLACE:
-        argv.append("--in-place")
-    if CSV_IMAGE_NAME_COLUMN:
-        argv.extend(["--image-name-column", CSV_IMAGE_NAME_COLUMN])
-    if CSV_IMAGE_PATH_COLUMN:
-        argv.extend(["--image-path-column", CSV_IMAGE_PATH_COLUMN])
-    if CSV_OCR_TEXT_COLUMN:
-        argv.extend(["--ocr-text-column", CSV_OCR_TEXT_COLUMN])
-    return argv
-
-
-def build_arg_parser():
-    parser = argparse.ArgumentParser(description="OCR CSV review workbook and reviewed EXIF writer")
-    parser.add_argument("mode", choices=["MAKE_REVIEW", "WRITE_EXIF", "make_review", "write_exif"])
-    parser.add_argument("--image-root", required=True, help="Source photo root folder")
-    parser.add_argument("--ocr-csv", default="", help="OCR result CSV path, required for MAKE_REVIEW")
-    parser.add_argument("--review-xlsx", required=True, help="Review workbook path")
-    parser.add_argument("--output-dir", default="reviewed_exif_output", help="Output folder for WRITE_EXIF")
-    parser.add_argument("--dry-run", action="store_true", help="Do not write photos; generate reports only")
-    parser.add_argument("--in-place", action="store_true", help="Modify source photos directly")
-    parser.add_argument(
-        "--overwrite-existing-exif",
-        action="store_true",
-        help="Allow reviewed values to replace EXIF fields that already exist",
-    )
-    parser.add_argument("--image-name-column", default="")
-    parser.add_argument("--image-path-column", default="")
-    parser.add_argument("--ocr-text-column", default="")
-    parser.add_argument("--expected-lat-min", type=float, default=EXPECTED_LAT_MIN)
-    parser.add_argument("--expected-lat-max", type=float, default=EXPECTED_LAT_MAX)
-    parser.add_argument("--expected-lon-min", type=float, default=EXPECTED_LON_MIN)
-    parser.add_argument("--expected-lon-max", type=float, default=EXPECTED_LON_MAX)
-    parser.add_argument("--photo-display-max-width", type=int, default=520)
-    parser.add_argument("--photo-display-max-height", type=int, default=320)
-    parser.add_argument(
-        "--excel-image-mode",
-        choices=["thumbnail", "none", "original"],
-        default="thumbnail",
-        help="thumbnail (default), none (hyperlink only), or original image embedding",
-    )
-    parser.add_argument("--thumbnail-quality", type=int, default=70)
-    return parser
-
-
 def clean_cell(value):
     if value is None:
         return ""
     return str(value).strip()
+
+
+def normalize_path(value):
+    return clean_cell(value).replace("/", os.sep).replace("\\", os.sep)
 
 
 def normalize_text(text):
@@ -218,83 +118,6 @@ def normalize_text(text):
     text = re.sub(r'"{2,}', '"', text)
     text = re.sub(r"'{2,}", "'", text)
     return re.sub(r"\s+", " ", text).strip()
-
-
-def read_csv_rows(path):
-    for encoding in ("utf-8-sig", "utf-8", "gb18030", "gbk"):
-        try:
-            with open(path, "r", encoding=encoding, newline="") as f:
-                return list(csv.DictReader(f))
-        except UnicodeDecodeError:
-            continue
-    with open(path, "r", newline="") as f:
-        return list(csv.DictReader(f))
-
-
-def pick_column(headers, explicit, candidates):
-    if explicit:
-        if explicit not in headers:
-            raise ValueError("Column not found: %s. Available: %s" % (explicit, ", ".join(headers)))
-        return explicit
-
-    lowered = {clean_cell(header).lower(): header for header in headers}
-    for candidate in candidates:
-        if candidate in headers:
-            return candidate
-        key = candidate.lower()
-        if key in lowered:
-            return lowered[key]
-    return ""
-
-
-def build_image_index(image_root):
-    index = {}
-    for root, _, files in os.walk(image_root):
-        for name in files:
-            if os.path.splitext(name)[1].lower() in IMAGE_EXTENSIONS:
-                index.setdefault(name.lower(), []).append(os.path.join(root, name))
-    return index
-
-
-def normalize_path(value):
-    return clean_cell(value).replace("/", os.sep).replace("\\", os.sep)
-
-
-def find_image(row, csv_dir, image_root, image_index, name_col, path_col):
-    values = []
-    if path_col:
-        values.append(normalize_path(row.get(path_col)))
-    if name_col:
-        values.append(normalize_path(row.get(name_col)))
-
-    candidates = []
-    for value in values:
-        if not value:
-            continue
-        if os.path.isabs(value):
-            candidates.append(value)
-        else:
-            candidates.append(os.path.abspath(os.path.join(csv_dir, value)))
-            candidates.append(os.path.abspath(os.path.join(image_root, value)))
-
-    for candidate in candidates:
-        if os.path.isfile(candidate):
-            return candidate
-
-    basename = ""
-    for value in values:
-        if value:
-            basename = os.path.basename(value).lower()
-            break
-    if not basename:
-        return ""
-
-    matches = image_index.get(basename, [])
-    if len(matches) == 1:
-        return matches[0]
-    if len(matches) > 1:
-        raise ValueError("Multiple images with same name: %s" % basename)
-    return ""
 
 
 class ParseWarning(ValueError):
@@ -933,128 +756,6 @@ def parse_datetime_from_ocr(text):
     return ""
 
 
-def coordinate_in_expected_range(lat, lon, args):
-    return (
-        args.expected_lat_min <= lat <= args.expected_lat_max
-        and args.expected_lon_min <= lon <= args.expected_lon_max
-    )
-
-
-def detect_csv_columns(rows, args):
-    headers = list(rows[0].keys())
-    name_col = pick_column(
-        headers,
-        args.image_name_column,
-        ["Name", "FileName", "Filename", "SourceFile", "\u56fe\u7247\u540d\u79f0", "\u56fe\u7247\u540d", "\u7167\u7247\u540d\u79f0", "\u7167\u7247\u540d", "\u6587\u4ef6\u540d"],
-    )
-    path_col = pick_column(
-        headers,
-        args.image_path_column,
-        ["Path", "SourcePath", "SourceFile", "\u56fe\u7247\u8def\u5f84", "\u7167\u7247\u8def\u5f84", "\u6587\u4ef6\u8def\u5f84", "\u8def\u5f84"],
-    )
-    ocr_col = pick_column(
-        headers,
-        args.ocr_text_column,
-        ["OCR", "Text", "OCR\u7ed3\u679c", "\u8bc6\u522b\u7ed3\u679c", "\u8bc6\u522b\u6587\u672c", "\u6587\u5b57\u8bc6\u522b\u7ed3\u679c", "\u6587\u5b57", "\u6587\u672c"],
-    )
-    if not ocr_col:
-        raise ValueError("Could not detect OCR text column. Available: %s" % ", ".join(headers))
-    if not name_col and not path_col:
-        raise ValueError("Could not detect image name/path column. Available: %s" % ", ".join(headers))
-    return name_col, path_col, ocr_col
-
-
-def make_review_records(args):
-    rows = read_csv_rows(args.ocr_csv)
-    if not rows:
-        raise ValueError("No OCR CSV rows found: %s" % args.ocr_csv)
-
-    name_col, path_col, ocr_col = detect_csv_columns(rows, args)
-    image_root = os.path.abspath(args.image_root)
-    csv_dir = os.path.dirname(os.path.abspath(args.ocr_csv))
-    image_index = build_image_index(image_root)
-
-    records = []
-    for row_no, row in enumerate(rows, start=2):
-        ocr_text = clean_cell(row.get(ocr_col))
-        image_path = ""
-        status = "OK"
-        tips = []
-        lat_text = ""
-        lon_text = ""
-        shooting_time = ""
-        review_decision = V_UNREVIEWED
-
-        try:
-            image_path = find_image(row, csv_dir, image_root, image_index, name_col, path_col)
-            if not image_path:
-                raise ValueError("image not found")
-        except Exception as exc:
-            status = "FAIL"
-            tips.append(str(exc))
-
-        try:
-            lat_text, lon_text, lat_value, lon_value = gps_candidates_from_ocr(ocr_text)
-            if lat_value is not None and lon_value is not None:
-                validate_lat_lon(lat_value, lon_value)
-                if not coordinate_in_expected_range(lat_value, lon_value, args):
-                    status = "SUSPICIOUS" if status == "OK" else status
-                    tips.append("outside expected coordinate range")
-            else:
-                status = "SUSPICIOUS" if status == "OK" else status
-                if lat_value is None:
-                    tips.append("latitude not found")
-                if lon_value is None:
-                    tips.append("longitude not found")
-        except Exception as exc:
-            status = "FAIL"
-            tips.append(str(exc))
-
-        shooting_time = parse_datetime_from_ocr(ocr_text)
-        if not shooting_time:
-            status = "SUSPICIOUS" if status == "OK" else status
-            tips.append("shooting time not found")
-
-        if image_path and os.path.isfile(image_path):
-            exif_summary = read_exif_summary(image_path)
-            has_exif_gps = bool(clean_cell(exif_summary.get("exif_lat")) and clean_cell(exif_summary.get("exif_lon")))
-            has_exif_time = bool(
-                clean_cell(exif_summary.get("DateTimeOriginal"))
-                or clean_cell(exif_summary.get("DateTimeDigitized"))
-                or clean_cell(exif_summary.get("ImageDateTime"))
-            )
-            if has_exif_gps and has_exif_time:
-                review_decision = V_SKIP
-                status = STATUS_EXIF_COMPLETE
-                tips.append(
-                    "source image already has GPS/time EXIF; reviewer can skip. "
-                    "GPS=%s,%s; time=%s"
-                    % (
-                        clean_cell(exif_summary.get("exif_lat")),
-                        clean_cell(exif_summary.get("exif_lon")),
-                        clean_cell(exif_summary.get("DateTimeOriginal"))
-                        or clean_cell(exif_summary.get("DateTimeDigitized"))
-                        or clean_cell(exif_summary.get("ImageDateTime")),
-                    )
-                )
-
-        records.append({
-            L_REVIEW: review_decision,
-            L_PARSE_STATUS: status,
-            L_OCR_TEXT: ocr_text,
-            L_LON: lon_text,
-            L_LAT: lat_text,
-            L_TIME: shooting_time,
-            L_PHOTO: "",
-            L_PHOTO_LINK: image_path,
-            L_SOURCE_PATH: image_path,
-            L_TIPS: "; ".join(tips),
-            L_NOTE: "",
-            "_row_no": row_no,
-        })
-    return records
-
-
 def add_original_image_to_sheet(sheet, image_path, cell, max_width, max_height):
     from openpyxl.drawing.image import Image as ExcelImage
     from PIL import Image as PILImage
@@ -1435,40 +1136,6 @@ def read_exif_summary(image_path):
     return result
 
 
-def write_result_report_csv(path, rows):
-    out_dir = os.path.dirname(os.path.abspath(path))
-    if out_dir and not os.path.isdir(out_dir):
-        os.makedirs(out_dir)
-    fields = [
-        "status",
-        "reason",
-        "review_row",
-        "review_decision",
-        "parse_status",
-        "input_image_path",
-        "output_image_path",
-        "written_lat",
-        "written_lon",
-        "review_lat_text",
-        "review_lon_text",
-        "written_shooting_datetime",
-        "exif_lat",
-        "exif_lon",
-        "GPSLatitudeRef",
-        "GPSLongitudeRef",
-        "DateTimeOriginal",
-        "DateTimeDigitized",
-        "ImageDateTime",
-        "GPSMapDatum",
-        "review_note",
-    ]
-    with open(path, "w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
-
-
 def result_report_image_path(row):
     output_path = clean_cell(row.get("output_image_path"))
     if output_path and not output_path.startswith("(") and os.path.isfile(output_path):
@@ -1558,28 +1225,6 @@ def write_result_report_xlsx(path, rows, max_width=520, max_height=340):
     sheet.freeze_panes = "A2"
     sheet.auto_filter.ref = sheet.dimensions
     workbook.save(path)
-
-
-def write_property_description(path):
-    text = (
-        "\u7167\u7247\u5c5e\u6027\u5199\u5165\u8bf4\u660e\n\n"
-        "\u672c\u6d41\u7a0b\u4f1a\u5148\u6309\u539f\u59cb\u6839\u76ee\u5f55\u7684\u5b50\u6587\u4ef6\u5939\u7ed3\u6784\u590d\u5236\u6240\u6709\u6587\u4ef6\uff0c\u5305\u62ec\u56fe\u7247\u3001Excel\u3001CSV\u3001PDF \u7b49\u5176\u4ed6\u8d44\u6599\u3002\n"
-        "\u5ba1\u6838\u7ed3\u679c\u4e3a\u201c\u901a\u8fc7\u201d\u7684 JPG/JPEG/PNG \u4f1a\u6839\u636e\u5ba1\u6838\u8868\u5199\u5165\u5c5e\u6027\uff1a\u7ecf\u7eac\u5ea6\u548c\u62cd\u6444\u65f6\u95f4\u53ef\u540c\u65f6\u5199\u5165\uff1b\u5982\u679c\u7ecf\u7eac\u5ea6\u4e3a\u7a7a\u4f46\u62cd\u6444\u65f6\u95f4\u6709\u503c\uff0c\u5219\u53ea\u5199\u5165\u62cd\u6444\u65f6\u95f4\uff0c\u4e0d\u6539\u5176\u4ed6\u5c5e\u6027\u3002\n"
-        "PNG \u4f1a\u5199\u5165 eXIf \u5143\u6570\u636e\uff0c\u4f46\u4e0d\u540c\u8f6f\u4ef6\u5bf9 PNG EXIF/GPS \u7684\u8bc6\u522b\u517c\u5bb9\u6027\u53ef\u80fd\u4e0d\u4e00\u81f4\u3002\n"
-        "\u7ecf\u7eac\u5ea6\u7edf\u4e00\u6309\u5317\u7eac\u3001\u4e1c\u7ecf\u5904\u7406\uff0c\u5373 EXIF \u65b9\u5411\u5b57\u6bb5\u5199\u5165 N/E\u3002\n\n"
-        "\u5199\u5165\u5b57\u6bb5\uff1a\n"
-        "1. GPSLatitudeRef\uff1a\u7eac\u5ea6\u65b9\u5411\uff0c\u5317\u7eac N\uff0c\u5357\u7eac S\u3002\n"
-        "2. GPSLatitude\uff1a\u7eac\u5ea6\u6570\u503c\uff0cEXIF \u5185\u90e8\u4ee5\u5ea6/\u5206/\u79d2\u6709\u7406\u6570\u5f62\u5f0f\u4fdd\u5b58\u3002\n"
-        "3. GPSLongitudeRef\uff1a\u7ecf\u5ea6\u65b9\u5411\uff0c\u4e1c\u7ecf E\uff0c\u897f\u7ecf W\u3002\n"
-        "4. GPSLongitude\uff1a\u7ecf\u5ea6\u6570\u503c\uff0cEXIF \u5185\u90e8\u4ee5\u5ea6/\u5206/\u79d2\u6709\u7406\u6570\u5f62\u5f0f\u4fdd\u5b58\u3002\n"
-        "5. GPSMapDatum\uff1a\u5199\u5165 WGS-84\u3002\n"
-        "6. GPSVersionID\uff1a\u5199\u5165 2.3.0.0\u3002\n"
-        "7. DateTimeOriginal\uff1a\u62cd\u6444\u65e5\u671f/\u539f\u59cb\u62cd\u6444\u65f6\u95f4\uff0c\u683c\u5f0f YYYY:MM:DD HH:MM:SS\u3002\n"
-        "8. DateTimeDigitized\uff1a\u4e0e\u62cd\u6444\u65f6\u95f4\u540c\u6b65\u5199\u5165\u3002\n"
-        "9. Image DateTime\uff1a\u4e0e\u62cd\u6444\u65f6\u95f4\u540c\u6b65\u5199\u5165\u3002\n"
-    )
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
 
 
 def cleanup_old_generated_reports(output_dir):
@@ -1851,39 +1496,3 @@ def write_exif_from_review(args):
         print("Copied source files: %d copy_failed=%d" % (copied_total, copy_failed))
     print("Result report XLSX: %s" % report_xlsx)
     return 0 if total_fail == 0 else 2
-
-
-def make_review(args):
-    records = make_review_records(args)
-    write_review_workbook(
-        os.path.abspath(args.review_xlsx),
-        records,
-        args.photo_display_max_width,
-        args.photo_display_max_height,
-        image_mode=args.excel_image_mode,
-        thumbnail_quality=args.thumbnail_quality,
-    )
-    print("Done. Review workbook: %s" % os.path.abspath(args.review_xlsx))
-    print("Rows: %d" % len(records))
-    return 0
-
-
-def main(argv=None):
-    args = build_arg_parser().parse_args(argv)
-    args.mode = args.mode.upper()
-    args.image_root = os.path.abspath(args.image_root)
-    args.review_xlsx = os.path.abspath(args.review_xlsx)
-    args.output_dir = os.path.abspath(args.output_dir)
-    args.ocr_csv = os.path.abspath(args.ocr_csv) if args.ocr_csv else ""
-
-    if args.mode == "MAKE_REVIEW":
-        if not args.ocr_csv:
-            raise ValueError("--ocr-csv is required for MAKE_REVIEW")
-        return make_review(args)
-    return write_exif_from_review(args)
-
-
-if __name__ == "__main__":
-    if len(sys.argv) == 1 and USE_VSCODE_CONFIG:
-        sys.exit(main(vscode_config_argv()))
-    sys.exit(main())
