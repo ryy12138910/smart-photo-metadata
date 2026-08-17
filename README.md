@@ -1,226 +1,199 @@
-# 图片经纬度/拍摄日期智能补全
+# Smart Photo Metadata
 
-通过识别照片水印，智能提取经纬度与拍摄日期，并自动补全照片的地理位置及拍摄时间元数据。
+批量识别照片水印中的**经纬度和拍摄时间**，生成可人工复核的 Excel，并将确认后的结果写入新照片的 EXIF。
 
-## 批量随机覆盖照片拍摄日期
+## 这个程序解决什么问题
 
-`utils/photo_datetime_randomizer/randomize_photo_datetime.py` 会递归处理输入目录中的 JPG、JPEG 和 PNG。
-照片按“直接父文件夹”分组：同一最末级照片文件夹使用同一天，组内时间按文件名顺序小幅递增。
-默认日期范围为 2026-06-01 至 2026-07-25（含首尾），时间范围为 08:30 至 17:00，
-同组照片的最大时间跨度为 10 分钟。
+现场拍摄、巡检或测绘照片经常遇到以下情况：
 
-最简单的用法是把照片文件夹拖到 `utils/photo_datetime_randomizer/修改照片日期.bat`
-上。也可以使用命令行：
+- 照片画面上有经纬度和日期水印，但文件本身没有 GPS 或拍摄时间；
+- 照片数量较多，逐张查看、复制和填写效率很低；
+- OCR 可能把数字、方向或日期识别错，需要人工快速复核；
+- 不能直接修改原始照片，希望先检查结果，再生成带完整 EXIF 的副本。
 
-```powershell
-.\.venv\Scripts\python.exe .\utils\photo_datetime_randomizer\randomize_photo_datetime.py "E:\照片下载结果_缺失补充"
-```
-
-默认不会修改原图，而是在输入目录旁新建“原目录名_日期已修改”，并生成
-`照片日期修改记录.csv`。程序覆盖照片的三个常用 EXIF 日期字段，同时同步输出文件的
-创建、访问和修改时间；GPS 等其他 EXIF 保持不变。
-
-先预览分配结果但不写文件：
-
-```powershell
-.\.venv\Scripts\python.exe .\utils\photo_datetime_randomizer\randomize_photo_datetime.py "E:\照片下载结果_缺失补充" --dry-run --seed 2026
-```
-
-需要固定输出位置或直接修改原图时：
-
-```powershell
-.\.venv\Scripts\python.exe .\utils\photo_datetime_randomizer\randomize_photo_datetime.py "E:\照片" --output-dir "E:\照片_新日期" --seed 2026
-.\.venv\Scripts\python.exe .\utils\photo_datetime_randomizer\randomize_photo_datetime.py "E:\照片" --in-place --seed 2026
-```
-
-`--in-place` 会直接改原图，使用前务必自行备份。
-
-这套流程保持“Excel 可人工复核”的原有做法，但把处理顺序调整为逐字段融合：
-
-1. 先读取原图 EXIF，已有字段永不靠模型猜测。
-2. 对缺字段图片调用本机 Umi-OCR 接口（程序可自动启动 Umi）。
-3. 规则解析 OCR，并修复本项目里常见的“东经→东纪、120→720”错误。
-4. 默认只将缺字段、超范围、解析失败或发生纠错的图片交给百炼 `qwen3.5-ocr` 并发复核。
-5. 仅将仍缺字段、低置信或与 Umi 结果冲突的图片交给 `qwen3.6-flash` 做最终视觉复核。
-6. 按 `EXIF > 视觉模型 > OCR` 逐字段融合，输出带来源、置信度和问题说明的审核表。
-7. 高置信且无冲突的行标为“自动通过”；冲突、低置信或仍缺字段的行标为“待核”。
-8. 写出时复制原目录结构，只给“通过/自动通过”行写入 EXIF。
-
-当前审核流程分为四个阶段：先完成全部图片的 EXIF/Umi-OCR 并保存断点，再把需要复核的问题图片
-并发提交给百炼 Qwen3.5-OCR；仅把仍然不确定的图片提交给 Qwen3.6-Flash，最后统一融合字段并
-生成审核表。Umi-OCR 默认每批 32 张，以文件
-路径提交到同一个 Umi `MissionOCR` 任务队列并逐图返回结果，不再逐张读取原图、转换 Base64
-和建立 HTTP 请求。百炼阶段采用单图请求并行化，默认 Qwen3.5-OCR 并发 10、Qwen3.6-Flash
-并发 5；429 和临时 5xx 错误会自动退避重试。
-
-模型只允许转写图片上明确可见的水印，不允许根据地名或建筑物猜经纬度。
-
-## 环境
-
-### 准备 Umi-OCR
-
-为避免仓库体积过大，Umi-OCR 的 Windows 运行包不纳入版本控制。请从
-[Umi-OCR Releases](https://github.com/hiroi-sora/Umi-OCR/releases) 下载 Paddle v2.1.5，
-解压后确认可执行文件位于：
+本程序将这套工作整理为一个可重复的流程：
 
 ```text
-utils/Umi-OCR_Paddle_v2.1.5/Umi-OCR.exe
+读取照片原有 EXIF
+        ↓
+识别照片水印中的经纬度和拍摄时间
+        ↓
+生成 Excel 审核表
+        ↓
+人工检查少量“待核”记录
+        ↓
+复制原照片并写入确认后的 EXIF
 ```
 
-### 安装 Python 依赖
+程序会优先保留照片已有的 EXIF，只补充缺失字段。默认输出到新目录，不修改原始照片。
+
+## 主要功能
+
+- 递归扫描照片文件夹，批量读取已有 EXIF；
+- 使用本地 Umi-OCR 识别照片水印；
+- 可使用阿里云百炼视觉模型复核 OCR 不确定的照片；
+- 自动整理经度、纬度和拍摄时间；
+- 生成带照片链接、识别结果、置信度和审核状态的 Excel；
+- 对高置信结果自动通过，将异常或冲突结果标记为“待核”；
+- 将审核通过的数据写入 JPG、JPEG 或 PNG 的 EXIF；
+- 保留原始目录结构，并生成写入结果报告；
+- 支持中断后继续处理，避免重复识别已经完成的照片。
+
+## 使用前准备
+
+### 1. 下载项目
+
+可以在 GitHub 页面点击 **Code → Download ZIP**，解压到本地；也可以使用 Git：
 
 ```powershell
-py -m pip install -r requirements.txt
+git clone https://github.com/ryy12138910/smart-photo-metadata.git
+cd smart-photo-metadata
 ```
 
-默认模式需要阿里云百炼 API Key。PowerShell 中执行（将值替换为实际 Key）：
+### 2. 安装 Python 环境
+
+本项目主要面向 Windows。请先安装 Python 3，然后在项目目录打开 PowerShell，执行：
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+如果电脑无法识别 `py`，可以将第一条命令中的 `py` 改为 `python`。
+
+### 3. 安装 Umi-OCR
+
+Umi-OCR 运行包体积较大，因此没有放入本仓库。
+
+1. 打开 [Umi-OCR Releases](https://github.com/hiroi-sora/Umi-OCR/releases)；
+2. 下载 Windows 版 **Paddle v2.1.5**；
+3. 解压到项目的 `utils` 目录；
+4. 确认最终路径如下：
+
+```text
+smart-photo-metadata/
+└─ utils/
+   └─ Umi-OCR_Paddle_v2.1.5/
+      └─ Umi-OCR.exe
+```
+
+### 4. 配置视觉模型（推荐）
+
+默认使用阿里云百炼的 Qwen OCR 和 Qwen Flash 复核不确定结果。准备好百炼 API Key 后，在 PowerShell 中执行：
 
 ```powershell
 [Environment]::SetEnvironmentVariable(
   "DASHSCOPE_API_KEY",
-  "YOUR_DASHSCOPE_API_KEY",
+  "替换成你的API_KEY",
   [EnvironmentVariableTarget]::User
 )
 ```
 
-验证是否设置成功：
+设置完成后，重新打开程序。如果暂时不使用云端模型，也可以在界面的“模型策略”中选择**关闭本地模型，仅使用 OCR**。
 
-```powershell
-[bool][Environment]::GetEnvironmentVariable(
-  "DASHSCOPE_API_KEY",
-  [EnvironmentVariableTarget]::User
-)
+> 使用百炼模式时，需要复核的照片会上传到阿里云模型服务。不要处理不允许上传到第三方服务的敏感照片。
+
+## 如何使用
+
+### 第一步：启动程序
+
+在项目目录中双击：
+
+```text
+启动图形界面.bat
 ```
 
-显示 `True` 后，关闭已经打开的图形界面，再双击 `start_gui.bat`，让新进程读取环境变量。
-API Key 不写入配置、缓存或日志。也可用 `--llm-provider ollama-cloud`、`ollama` 或
-`openai` 切换回原有模型接口。
+如果窗口没有打开，请先确认 `.venv` 已创建、依赖已安装，并且 `photo_metadata_gui.py` 位于项目根目录。
 
-## 图形界面（推荐日常使用）
+### 第二步：生成审核表
 
-在项目文件夹中双击 `启动图形界面.bat`，即可打开本地桌面页面，不需要手工输入命令。
-界面分为两个页签：
+打开界面后，进入 **生成审核 XLSX**：
 
-1. `生成审核 XLSX`：选择照片根目录和审核表保存位置，设置模型策略、缩略图模式及
-   小范围测试条件，然后点击“开始生成审核表”。
-2. `生成新图片`：选择原始照片目录、审核后的 XLSX 和输出目录。第一次建议勾选
-   “仅演练”，检查 `write_result_report.xlsx` 后再取消勾选正式生成图片。
+1. 选择需要处理的照片根目录；
+2. 选择审核表的保存位置；
+3. 保持默认模型策略，或按需要选择仅使用 OCR；
+4. 第一次测试时，将“最多处理图片数”设置为 `10` 或 `20`；
+5. 点击 **开始生成审核表**。
 
-页面底部会显示实时日志和图片处理进度。任务中途停止时，审核表旁边的 `.cache.json`
-和 `.cache.json.journal` 会保留逐图断点。再次选择完全相同的照片根目录及审核表路径后，
-界面会显示“已恢复上次断点”，已完成图片不会再次读取 EXIF、调用 OCR 或调用本地模型。
-点击“停止当前任务”或直接关闭窗口时，程序会先尝试保存当前图片断点，再结束后台进程。
+处理完成后会得到一个 `metadata_review.xlsx`。程序会在表中记录：
 
-大批量任务默认使用“不嵌入图片，仅保留链接（最快）”，避免为每张照片生成 Excel 缩略图；
-如果审核时确实需要直接看图，可手动改为“压缩缩略图”。缓存采用逐图追加写入，不再每处理
-一张照片就重写整个缓存文件。
+- 审核结果；
+- 经度、纬度和拍摄时间；
+- 字段来源和置信度；
+- OCR 原文、异常提示和模型说明；
+- 原图路径及照片链接。
 
-也可以在已激活的虚拟环境中直接启动：
+### 第三步：人工复核
 
-```powershell
-.\.venv\Scripts\python.exe photo_metadata_gui.py
-```
+用 Excel 打开审核表：
 
-## 第一步：生成智能审核表
+1. 筛选 `审核结果 = 待核`；
+2. 对照照片检查经度、纬度和拍摄时间；
+3. 直接修改错误字段；
+4. 确认无误后，将该行的审核结果改为 `通过`；
+5. 保存并关闭 Excel。
 
-```powershell
-py smart_photo_metadata.py review `
-  --image-root "D:\code\lon\data\跨塘社区城建资料\跨塘社区建筑照片" `
-  --review-xlsx "D:\code\lon\output\metadata_review.xlsx"
-```
+`自动通过` 和人工标记为 `通过` 的记录，才会进入后续写入流程。无法确认的照片可以保持“待核”或改为“跳过”。
 
-程序支持中断续跑，OCR、模型和已合并的审核行保存在审核表旁边的缓存及追加式断点日志中。
-先小范围验证时可加 `--max-images 20` 或 `--path-contains "10幢"`。
-程序使用 Umi 的 `127.0.0.1:1224` 本地接口，识别边长设置为 960，以提高批量识别速度。
-实现参考 [Umi-OCR 官方命令行手册](https://github.com/hiroi-sora/Umi-OCR/blob/main/docs/README_CLI.md)：
-使用路径列表进入 Umi 内部批量任务。默认 `--ocr-batch-size 32`，每个批次完成后将逐图结果
-写入断点。每次任务只检查并启动一次 Umi 服务；服务不可用时整项任务直接报错，不再对每张图片
-重复等待。
-OCR 阶段全部完成后才进入批量模型复核阶段；关闭任务后重新使用相同路径，可以直接复用已完成的
-OCR 断点和已完成的模型批次。
-默认使用 `qwen3.5-ocr` 和 `qwen3.6-flash`，关闭思考模式并要求精简 JSON。
-`--llm-review-mode suspicious` 只让模型处理异常 OCR。如需让模型复核所有
-EXIF 不完整的图片，可显式增加 `--llm-review-mode all`。
+### 第四步：生成带 EXIF 的新照片
 
-百炼相关参数：
+回到程序，进入 **生成新图片**：
 
-- `--dashscope-ocr-concurrency 10`：第一阶段专用 OCR 并发数。
-- `--dashscope-review-concurrency 5`：最终视觉复核并发数。
-- `--api-max-retries 4`：429/5xx 自动退避重试次数。
-- `--refresh-model`：忽略已有成功模型断点并重新请求。
+1. 选择原始照片根目录；
+2. 选择刚才保存的审核表；
+3. 选择新图片输出目录；
+4. 第一次运行时勾选 **仅演练，不生成图片**；
+5. 检查结果报告，确认没有路径或字段错误；
+6. 取消“仅演练”，再次运行并正式生成照片。
 
-日志会分别显示两个阶段的调用数、累计 Token、耗时和预估费用。成功的逐图结果立即写入
-断点；关闭程序后再次使用相同的照片目录与审核表路径，只重试未完成或失败的接口请求。
+默认情况下：
 
-如暂时不使用模型：
+- 原始照片不会被修改；
+- 新照片会保留原目录结构；
+- 已有 GPS 或拍摄时间不会被覆盖；
+- 只给“通过”或“自动通过”的记录写入 EXIF。
 
-```powershell
-py smart_photo_metadata.py review ... --llm-provider none
-```
+## 会生成哪些文件
 
-## 第二步：只检查“待核”行
+| 文件 | 用途 |
+| --- | --- |
+| `metadata_review.xlsx` | 查看识别结果并完成人工复核 |
+| `photos_with_exif/` | 保存写入 EXIF 后的新照片 |
+| `write_result_report.xlsx` | 查看每张照片是否写入成功以及失败原因 |
+| `.cache.json` / `.journal` | 保存处理进度，供中断后继续运行 |
 
-审核表中的关键列：
+缓存文件应与审核表放在一起。在任务完成并确认不再需要断点续跑前，不建议删除。
 
-- `审核结果`：自动通过、待核、通过、跳过等。
-- `字段来源`：每个字段来自 EXIF、Umi-OCR 还是视觉模型。
-- `字段置信度`：经度、纬度、时间分别评分。
-- `解析提示`：缺字段、范围异常和来源冲突。
-- `模型说明`：模型看见的原始证据，方便快速核对。
+## 支持的照片格式
 
-筛选 `审核结果=待核`，修改经纬度/时间后将该行改成 `通过`。
-若希望所有行都由人确认，生成审核表时加 `--no-auto-approve`。
+- 扫描和生成审核表：JPG、JPEG、PNG、BMP、WebP；
+- 写入 GPS 和拍摄时间：JPG、JPEG、PNG；
+- BMP 和 WebP 可以参与识别与审核，但不会写入 EXIF。
 
-## 第三步：写入新图片
+## 使用注意事项
 
-建议先做不写文件的演练：
+- 第一次使用时，建议先用 10～20 张照片测试完整流程；
+- 正式写入前先运行一次“仅演练”；
+- 不要把原始照片目录设置成输出目录；
+- 程序默认保留已有 EXIF，只有明确开启覆盖选项才会替换已有字段；
+- 图片只显示日期、不显示具体时分时，程序不会伪造 `00:00:00` 写入 EXIF；
+- 当前默认经纬度检查范围针对本项目区域，处理其他地区照片时需要调整预期经纬度范围；
+- 数据目录、输出目录、缓存、API Key 和本地 OCR 运行包均不会提交到 GitHub。
 
-```powershell
-py smart_photo_metadata.py write `
-  --image-root "D:\code\lon\data\跨塘社区城建资料\跨塘社区建筑照片" `
-  --review-xlsx "D:\code\lon\output\metadata_review.xlsx" `
-  --output-dir "D:\code\lon\output\photos_with_exif" `
-  --dry-run
-```
+## 项目中的主要文件
 
-确认结果报告后去掉 `--dry-run`。默认复制到新目录并保留原目录结构；除非已有可靠备份，不建议使用 `--in-place`。
-写出时默认只补缺失的 EXIF 字段，已有 GPS 或拍摄时间不会被覆盖。如果确实需要用审核表覆盖已有字段，必须显式增加 `--overwrite-existing-exif`。
+| 文件 | 说明 |
+| --- | --- |
+| `启动图形界面.bat` | Windows 推荐启动入口 |
+| `photo_metadata_gui.py` | 图形操作界面 |
+| `smart_photo_metadata.py` | 照片识别、审核表生成和 EXIF 写入主程序 |
+| `requirements.txt` | Python 依赖列表 |
+| `utils/` | Umi-OCR 目录及其他辅助工具 |
 
-## 设计上的安全边界
+## 附带工具
 
-- 完整 EXIF 直接保留并跳过，不被 OCR/模型覆盖。
-- 部分 EXIF 字段也保持最高优先级；默认写图时只补缺失字段。
-- 超出项目范围的 OCR 经纬度会逐字段丢弃，不再进入融合。
-- 合法且位于项目范围内的模型坐标会写入审核表；低分或缺少证据时保留候选值但标为待核。
-- OCR 与模型冲突时使用模型结果，并在解析提示中记录覆盖过程。
-- Umi-OCR 只识别到日期而没有时分时，会继续进入 Qwen OCR；Qwen OCR 仍只返回日期时，
-  再由 Qwen Flash 查看原图确认是否存在时分。
-- 图片明确显示时分时保留完整日期时间；图片只显示日期时，审核表只保留日期，不补
-  `00:00:00`；所有视觉来源都没有日期时保持为空，也不使用文件名猜测。
-- 标准 EXIF `DateTimeOriginal` 需要完整日期和时分，因此日期-only 结果会保留在审核表中，
-  但写出图片时不会伪造午夜时间写入 EXIF。
-- 百炼模式会将筛选出的异常图片上传到阿里云模型服务；完整 EXIF 或 Umi 已可靠识别的图片
-  不会上传。使用本地 Ollama 模式时图片仍只发送到本机模型服务。
+仓库还包含一个批量修改照片日期的独立工具。如有需要，请查看：
 
-## 同目录坐标一致性与审核表体积
+- [照片日期随机分配工具说明](utils/photo_datetime_randomizer/README.md)
 
-默认把图片的直接父目录视为同一拍摄对象。当目录中至少有 3 张图片具备完整坐标时，
-程序会计算组内中位坐标；某张由 OCR 提供的坐标偏离超过 500 米，即使格式正确且仍在
-项目范围内，也会调用本地模型重新查看原图。模型不可用、置信度过低或复核结果仍然离群
-时，该行会标为“待核”。可通过以下参数调整：
-
-- `--group-coordinate-threshold-meters 500`：离群距离阈值。
-- `--group-min-images 3`：启用组内检查所需的最少图片数。
-- `--no-group-consistency`：关闭该检查。
-
-审核表默认使用 `--excel-image-mode thumbnail`，嵌入的是最大 520×320、质量 70 的
-JPEG 缩略图，不再嵌入原图字节；“照片链接”和“原图路径”仍指向原始文件，写 EXIF
-时也仍使用原图。超大批次可完全不嵌图：
-
-```powershell
-py smart_photo_metadata.py review ... --excel-image-mode none
-```
-
-如确实需要恢复旧行为，可使用 `--excel-image-mode original`。缩略图大小还可通过
-`--photo-display-max-width`、`--photo-display-max-height` 和
-`--thumbnail-quality` 调整。
+该工具与经纬度智能补全主流程相互独立，使用前请单独阅读它的说明。
