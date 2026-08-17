@@ -31,10 +31,18 @@ if ($LASTEXITCODE -ne 0) {
 Copy-Item -LiteralPath (Join-Path $projectDir 'runtime') -Destination (Join-Path $distDir 'runtime') -Recurse
 Copy-Item -LiteralPath (Join-Path $projectDir '启动程序.bat') -Destination $distDir
 Copy-Item -LiteralPath (Join-Path $projectDir 'README.md') -Destination $distDir
+Copy-Item -LiteralPath (Join-Path $projectDir 'README_EN.md') -Destination $distDir
+Copy-Item -LiteralPath (Join-Path $projectDir 'LICENSE') -Destination $distDir
 
 $zipPath = Join-Path $projectDir 'dist\PhotoMetadataTool-Windows-x64.zip'
+$checksumPath = $zipPath + '.sha256'
 if (Test-Path -LiteralPath $zipPath) {
     Remove-Item -LiteralPath $zipPath -Force
 }
+if (Test-Path -LiteralPath $checksumPath) {
+    Remove-Item -LiteralPath $checksumPath -Force
+}
 Compress-Archive -LiteralPath $distDir -DestinationPath $zipPath -CompressionLevel Optimal
+$hash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+Set-Content -LiteralPath $checksumPath -Value "$hash  PhotoMetadataTool-Windows-x64.zip" -Encoding ascii
 Write-Host "便携包已生成：$zipPath"

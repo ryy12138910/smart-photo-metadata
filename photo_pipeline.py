@@ -173,6 +173,7 @@ def build_parser():
     )
     review.add_argument("--photo-display-max-width", type=int, default=520)
     review.add_argument("--photo-display-max-height", type=int, default=320)
+    review.add_argument("--language", choices=["zh", "en"], default="zh")
     review.add_argument(
         "--excel-image-mode",
         choices=["thumbnail", "none", "original"],
@@ -1962,6 +1963,7 @@ def create_review(args):
         args.photo_display_max_height,
         image_mode=args.excel_image_mode,
         thumbnail_quality=args.thumbnail_quality,
+        language=args.language,
     )
     cache.compact()
     print(

@@ -76,6 +76,34 @@ REVIEW_HEADERS = [
     L_NOTE,
 ]
 
+EN_HEADER_BY_ZH = {
+    L_REVIEW: "Review Decision",
+    L_PARSE_STATUS: "Parse Status",
+    L_SOURCE: "Field Source",
+    L_OCR_TEXT: "OCR Result",
+    L_LON: "Longitude",
+    L_LAT: "Latitude",
+    L_TIME: "Capture Time",
+    L_CONFIDENCE: "Field Confidence",
+    L_PHOTO: "Photo",
+    L_PHOTO_LINK: "Photo Link",
+    L_SOURCE_PATH: "Source Path",
+    L_TIPS: "Review Tips",
+    L_MODEL_NOTE: "Model Notes",
+    L_NOTE: "Reviewer Notes",
+}
+ZH_HEADER_BY_EN = {value: key for key, value in EN_HEADER_BY_ZH.items()}
+EN_DECISION_BY_ZH = {
+    V_UNREVIEWED: "Unreviewed",
+    V_APPROVED: "Approved",
+    V_AUTO_APPROVED: "Auto Approved",
+    V_CHECK: "Needs Review",
+    V_REJECTED: "Rejected",
+    V_SKIP: "Skip",
+}
+ZH_DECISION_BY_EN = {value: key for key, value in EN_DECISION_BY_ZH.items()}
+APPROVED_VALUES = APPROVED_VALUES + ("APPROVED", "AUTO APPROVED")
+
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
 JPG_EXTENSIONS = (".jpg", ".jpeg")
 WRITE_EXIF_EXTENSIONS = (".jpg", ".jpeg", ".png")
@@ -859,6 +887,7 @@ def write_review_workbook(
     max_height,
     image_mode="thumbnail",
     thumbnail_quality=70,
+    language="zh",
 ):
     try:
         from openpyxl import Workbook
@@ -878,8 +907,10 @@ def write_review_workbook(
     with tempfile.TemporaryDirectory(prefix="metadata_excel_thumbs_") as temp_dir:
         workbook = Workbook()
         sheet = workbook.active
-        sheet.title = "OCR\u5ba1\u6838"
-        sheet.append(REVIEW_HEADERS)
+        english = language == "en"
+        output_headers = [EN_HEADER_BY_ZH[header] for header in REVIEW_HEADERS] if english else REVIEW_HEADERS
+        sheet.title = "OCR Review" if english else "OCR\u5ba1\u6838"
+        sheet.append(output_headers)
 
         header_fill = PatternFill("solid", fgColor="D9EAF7")
         for cell in sheet[1]:
@@ -896,10 +927,14 @@ def write_review_workbook(
             STATUS_EXIF_COMPLETE: PatternFill("solid", fgColor="D9EAD3"),
         }
 
+        decision_values = [
+            V_UNREVIEWED, V_APPROVED, V_AUTO_APPROVED, V_CHECK, V_REJECTED, V_SKIP
+        ]
+        if english:
+            decision_values = [EN_DECISION_BY_ZH[value] for value in decision_values]
         validation = DataValidation(
             type="list",
-            formula1='"%s,%s,%s,%s,%s,%s"'
-            % (V_UNREVIEWED, V_APPROVED, V_AUTO_APPROVED, V_CHECK, V_REJECTED, V_SKIP),
+            formula1='"%s"' % ",".join(decision_values),
             allow_blank=False,
         )
         sheet.add_data_validation(validation)
@@ -908,7 +943,12 @@ def write_review_workbook(
         link_col = header_indexes[L_PHOTO_LINK]
 
         for index, record in enumerate(records, start=1):
-            sheet.append([record.get(header, "") for header in REVIEW_HEADERS])
+            values = [record.get(header, "") for header in REVIEW_HEADERS]
+            if english:
+                values[0] = EN_DECISION_BY_ZH.get(values[0], values[0])
+                if values[1] == STATUS_EXIF_COMPLETE:
+                    values[1] = "EXIF Complete"
+            sheet.append(values)
             row_index = sheet.max_row
             if image_mode == "none":
                 sheet.row_dimensions[row_index].height = 45
@@ -937,14 +977,16 @@ def write_review_workbook(
                     )
                     if not embedded:
                         sheet.cell(row_index, photo_col).value = (
-                            "\u672a\u5d4c\u5165\uff1b\u8bf7\u4f7f\u7528\u7167\u7247\u94fe\u63a5"
+                            "Not embedded; use the photo link"
+                            if english
+                            else "\u672a\u5d4c\u5165\uff1b\u8bf7\u4f7f\u7528\u7167\u7247\u94fe\u63a5"
                         )
                 except Exception as exc:
                     sheet.cell(row_index, photo_col).value = "image failed: %s" % exc
 
             link_cell = sheet.cell(row_index, link_col)
             if image_path:
-                link_cell.value = "\u6253\u5f00\u7167\u7247"
+                link_cell.value = "Open Photo" if english else "\u6253\u5f00\u7167\u7247"
                 link_cell.hyperlink = image_path
                 link_cell.style = "Hyperlink"
 
@@ -973,8 +1015,13 @@ def write_review_workbook(
             sheet.column_dimensions[get_column_letter(index)].width = widths_by_header.get(header, 18)
 
         sheet["A1"].comment = Comment(
-            "\u81ea\u52a8\u901a\u8fc7\u8868\u793a\u89c4\u5219\u6216\u672c\u5730\u6a21\u578b\u5df2\u7ed9\u51fa\u9ad8\u7f6e\u4fe1\u7ed3\u679c\uff1b"
-            "\u5f85\u6838\u884c\u624d\u9700\u4eba\u5de5\u5904\u7406\u3002\u901a\u8fc7\u548c\u81ea\u52a8\u901a\u8fc7\u90fd\u4f1a\u5199\u5165\u56fe\u7247\u5c5e\u6027\u3002",
+            (
+                "Auto Approved means the rules produced a high-confidence result. "
+                "Only Needs Review rows require manual handling. Approved and Auto Approved rows can be written to photo metadata."
+                if english
+                else "\u81ea\u52a8\u901a\u8fc7\u8868\u793a\u89c4\u5219\u6216\u672c\u5730\u6a21\u578b\u5df2\u7ed9\u51fa\u9ad8\u7f6e\u4fe1\u7ed3\u679c\uff1b"
+                "\u5f85\u6838\u884c\u624d\u9700\u4eba\u5de5\u5904\u7406\u3002\u901a\u8fc7\u548c\u81ea\u52a8\u901a\u8fc7\u90fd\u4f1a\u5199\u5165\u56fe\u7247\u5c5e\u6027\u3002"
+            ),
             "Codex",
         )
         sheet.freeze_panes = "A2"
@@ -991,15 +1038,21 @@ def read_review_rows(xlsx_path):
     workbook = openpyxl.load_workbook(xlsx_path, data_only=True, read_only=True)
     sheet = workbook[workbook.sheetnames[0]]
     rows = list(sheet.iter_rows(values_only=True))
+    workbook.close()
     if not rows:
         return []
-    headers = [clean_cell(value) for value in rows[0]]
+    headers = [ZH_HEADER_BY_EN.get(clean_cell(value), clean_cell(value)) for value in rows[0]]
     result = []
     for row_index, row in enumerate(rows[1:], start=2):
         item = {"_row": row_index}
         for col_index, header in enumerate(headers):
             if header:
-                item[header] = row[col_index] if col_index < len(row) else None
+                value = row[col_index] if col_index < len(row) else None
+                if header == L_REVIEW:
+                    value = ZH_DECISION_BY_EN.get(clean_cell(value), value)
+                elif header == L_PARSE_STATUS and clean_cell(value) == "EXIF Complete":
+                    value = STATUS_EXIF_COMPLETE
+                item[header] = value
         result.append(item)
     return result
 

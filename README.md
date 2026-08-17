@@ -1,5 +1,7 @@
 # 照片水印信息整理工具
 
+[English](README_EN.md)
+
 用于批量整理工程现场、巡检、测绘等照片中的经纬度和拍摄时间。程序读取照片画面上的水印，生成可人工审核的 Excel；确认后，再把结果写入新照片的属性中。
 
 ## 背景
@@ -22,11 +24,13 @@
 
 ### 使用便携包
 
-在 GitHub Releases 下载 `PhotoMetadataTool-Windows-x64.zip`，解压后双击 `启动程序.bat`。便携包不要求安装 Python，也不需要配置环境变量或程序路径。
+普通用户请从 [GitHub Releases](https://github.com/ryy12138910/smart-photo-metadata/releases/latest) 下载 `PhotoMetadataTool-Windows-x64.zip`，不要使用仓库首页的“Code → Download ZIP”（后者是源代码）。
+
+下载后解压到普通文件夹，双击 `PhotoMetadataTool.exe` 或 `启动程序.bat`。便携包已经包含 Python 依赖和离线 OCR 组件，不需要安装 Python、运行 pip，也不需要配置环境变量或程序路径。界面右上角可切换中文和 English，英文界面生成的审核表也使用英文表头与审核选项。
 
 ### 从源代码启动
 
-双击 `启动程序.bat`。首次运行会自动准备所需组件，完成后直接打开操作界面。首次准备需要联网，之后纯 OCR 可离线使用。
+只有需要修改程序的开发者才建议使用源码。双击 `启动程序.bat` 后，首次运行会自动准备所需组件；该方式要求电脑已安装 Python 且能够访问依赖下载源。如果安装失败，请改用上面的 Windows 便携包。
 
 ## 操作流程
 
@@ -76,7 +80,7 @@
 
 ## 开发者构建
 
-在 Windows PowerShell 中运行 `build_portable.ps1`，可生成包含离线 OCR 组件的便携压缩包。构建结果位于 `dist` 目录。仓库也包含 Windows 自动构建流程，可在 GitHub Actions 中手动运行，或通过 `v*` 标签触发。
+在 Windows PowerShell 中运行 `build_portable.ps1`，可生成包含离线 OCR 组件的便携压缩包。构建结果位于 `dist` 目录。仓库也包含只读权限的 Windows 自动构建流程，可手动运行或通过 `v*` 标签触发；正式发布包由维护者核验后上传到 GitHub Releases。
 
 ## 许可证
 

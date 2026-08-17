@@ -25,5 +25,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: PhotoMetadataTool-Windows-x64
-          path: dist/PhotoMetadataTool-Windows-x64.zip
+          path: |
+            dist/PhotoMetadataTool-Windows-x64.zip
+            dist/PhotoMetadataTool-Windows-x64.zip.sha256
           if-no-files-found: error
