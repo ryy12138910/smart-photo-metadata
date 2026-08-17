@@ -77,3 +77,7 @@
 ## 开发者构建
 
 在 Windows PowerShell 中运行 `build_portable.ps1`，可生成包含离线 OCR 组件的便携压缩包。构建结果位于 `dist` 目录。仓库也包含 Windows 自动构建流程，可在 GitHub Actions 中手动运行，或通过 `v*` 标签触发。
+
+## 许可证
+
+本项目代码采用 [MIT License](LICENSE) 开放使用。
