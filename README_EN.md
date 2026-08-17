@@ -101,7 +101,7 @@ If a task is interrupted, run it again with the same photo folder and workbook p
 
 Download the Windows portable package from GitHub Releases and extract the complete ZIP before starting the application. Do not run the EXE from inside the ZIP preview and do not copy only the two EXE files. The `runtime` folder must remain beside `PhotoMetadataTool.exe`.
 
-Version `v1.0.0` had a Umi-OCR startup compatibility issue. Upgrade to `v1.0.2` or later. If a newer version still fails, check whether security software blocked `Umi-OCR.exe` under `runtime`, or whether another application is using local port `1224`.
+Version `v1.0.0` had a Umi-OCR startup compatibility issue. Upgrade to `v1.0.3` or later. If a newer version still fails, check whether security software blocked `Umi-OCR.exe` under `runtime`, or whether another application is using local port `1224`.
 
 ## Supported Systems and Files
 
