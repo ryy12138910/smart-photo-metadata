@@ -382,21 +382,33 @@ def umi_api_available(endpoint, timeout=2):
 def start_umi_server(executable, endpoint, timeout):
     if not os.path.isfile(executable):
         raise RuntimeError("Umi-OCR executable not found: %s" % executable)
-    command = [os.path.abspath(executable), "--hide"]
+    executable = os.path.abspath(executable)
+    executable_dir = os.path.dirname(executable)
+    command = [executable, "--hide"]
     kwargs = {
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
+        "cwd": executable_dir,
         "shell": False,
     }
-    if os.name == "nt":
-        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    subprocess.Popen(command, **kwargs)
-    deadline = time.time() + min(timeout, 30)
+    process = subprocess.Popen(command, **kwargs)
+    startup_timeout = max(30.0, min(float(timeout), 120.0))
+    deadline = time.time() + startup_timeout
     while time.time() < deadline:
         if umi_api_available(endpoint):
             return
         time.sleep(0.5)
-    raise RuntimeError("Umi-OCR local API did not become ready: %s" % endpoint)
+    exit_code = process.poll()
+    exit_note = (
+        " The launcher exited with code %s." % exit_code
+        if exit_code is not None
+        else " The process is still running but its local API is unavailable."
+    )
+    raise RuntimeError(
+        "Umi-OCR could not start its local API at %s after %.0f seconds.%s "
+        "Make sure the entire portable ZIP was extracted, the runtime folder is writable, "
+        "and security software is not blocking Umi-OCR.exe or local port 1224. "
+        "Executable: %s"
+        % (endpoint, startup_timeout, exit_note, executable)
+    )
 
 
 def ensure_umi_server_ready(executable, endpoint, timeout):
@@ -437,84 +449,26 @@ def run_umi_ocr(executable, image_path, timeout, endpoint=DEFAULT_UMI_ENDPOINT):
     return output
 
 
-def umi_batch_endpoint(endpoint):
-    base = endpoint.rstrip("/")
-    if base.endswith("/api/ocr"):
-        return base + "/batch"
-    return base + "/batch"
-
-
 def run_umi_ocr_batch(
     executable,
     image_paths,
     timeout,
     endpoint=DEFAULT_UMI_ENDPOINT,
 ):
-    """Submit paths to one Umi MissionOCR queue and return per-image results."""
-    del executable  # Kept in the signature for parity with run_umi_ocr().
+    """Run one supported Umi HTTP request per image and return mapped results."""
     if not image_paths:
         return {}
     paths = [os.path.abspath(path) for path in image_paths]
-    payload = {
-        "paths": paths,
-        "options": {
-            "ocr.limit_side_len": DEFAULT_OCR_LIMIT_SIDE_LEN,
-            "tbpu.parser": "multi_line",
-            "data.format": "text",
-        },
-    }
-    body = json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(
-        umi_batch_endpoint(endpoint),
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    batch_timeout = max(timeout, len(paths) * 5)
-    try:
-        with open_url_no_proxy(request, batch_timeout) as response:
-            result = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        if exc.code == 404:
-            raise RuntimeError(
-                "Umi-OCR batch API is unavailable; restart the bundled Umi-OCR once"
-            )
-        raise RuntimeError("Umi-OCR batch API HTTP error %s" % exc.code)
-    except urllib.error.URLError as exc:
-        raise RuntimeError("cannot reach Umi-OCR batch API: %s" % exc.reason)
-
-    if result.get("code") != 100 or not isinstance(result.get("data"), list):
-        raise RuntimeError(
-            "Umi-OCR batch API error %s: %s"
-            % (result.get("code"), result.get("data"))
-        )
-    expected = {os.path.normcase(path): path for path in paths}
     mapped = {}
-    for item in result["data"]:
-        if not isinstance(item, dict):
-            continue
-        returned_path = os.path.abspath(clean(item.get("path")))
-        key = os.path.normcase(returned_path)
-        if key not in expected or key in mapped:
-            continue
-        if item.get("code") == 100:
-            output = clean(item.get("data"))
-            if output:
-                mapped[key] = {"text": output, "error": ""}
-            else:
-                mapped[key] = {"text": "", "error": "Umi-OCR returned empty text"}
-        else:
+    for path in paths:
+        key = os.path.normcase(path)
+        try:
             mapped[key] = {
-                "text": "",
-                "error": "Umi-OCR API error %s: %s"
-                % (item.get("code"), item.get("data")),
+                "text": run_umi_ocr(executable, path, timeout, endpoint),
+                "error": "",
             }
-    missing = [path for key, path in expected.items() if key not in mapped]
-    if missing:
-        raise RuntimeError(
-            "Umi-OCR batch response missed %d image(s): %s"
-            % (len(missing), os.path.basename(missing[0]))
-        )
+        except Exception as exc:
+            mapped[key] = {"text": "", "error": str(exc)}
     return mapped
 
 
@@ -1584,8 +1538,8 @@ def create_review(args):
     pending_ocr = []
 
     # Phase 1a: read EXIF and collect every image that still needs OCR. The
-    # actual OCR calls are deliberately deferred so Umi receives path batches
-    # instead of one Base64 HTTP request per image.
+    # actual OCR calls are deliberately deferred so progress and checkpointing
+    # can be managed in predictable groups.
     for prepared in prepared_items:
         image_path, relative, item, is_completed, has_checkpoint = prepared
         check_cancelled(args)
@@ -1631,9 +1585,8 @@ def create_review(args):
         ):
             pending_ocr.append(stage)
 
-    # Phase 1b: one readiness check, then path-based MissionOCR queues. A
-    # service-level failure aborts the phase once instead of waiting again for
-    # every remaining image. Individual image failures are still checkpointed.
+    # Phase 1b: one readiness check, then use Umi's documented image OCR API.
+    # Individual image failures are checkpointed so later runs can retry them.
     ocr_done = len(image_paths) - len(pending_ocr)
     if pending_ocr:
         ensure_umi_server_ready(
@@ -1665,7 +1618,7 @@ def create_review(args):
                 cache.save(stage["relative"])
                 ocr_done += 1
             print(
-                "[ocr %d/%d] Umi 批量完成 %d 张，耗时 %.2f 秒（%.2f 秒/张）"
+                "[ocr %d/%d] Umi OCR 完成 %d 张，耗时 %.2f 秒（%.2f 秒/张）"
                 % (
                     ocr_done,
                     len(image_paths),

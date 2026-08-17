@@ -48,6 +48,20 @@ The selected model must support image input. The API key is supplied only to the
 
 Open the completed workbook and inspect rows marked **Needs Review**. Correct coordinates or capture times, change confirmed rows to **Approved**, and save the workbook.
 
+#### Processing Options
+
+| Option | Description |
+| --- | --- |
+| Recognition Mode | OCR Only runs entirely on the computer. OCR + LLM API sends photos that need review to the configured API. |
+| API Endpoint | The complete image-chat endpoint supplied by the provider. Used only in LLM API mode. |
+| Model Name | The provider's model identifier. The selected model must support image input. |
+| API Key | The credential used for the current model task. The application does not save it. |
+| API Review Scope | Review Exceptions Only reduces API calls. Review All Photos with Missing Metadata is more comprehensive but may increase usage and cost. |
+| Workbook Images | Keep links only, embed compressed thumbnails, or embed original photos. Embedding originals can make the workbook very large. |
+| Path Filter | Process only photos whose full path contains this text. Leave it blank to process every supported photo under the selected root folder. |
+| Photo Limit | Maximum number of photos for this run. Enter `0` for no limit. This is useful for a small pilot run. |
+| Folder Outlier Threshold (m) | Flags an OCR coordinate when it differs from the typical location of other photos in the same direct folder by more than this distance. The default is `500` metres. |
+
 ### 2. Write New Photos
 
 1. Open the **Write New Photos** tab.
@@ -56,6 +70,13 @@ Open the completed workbook and inspect rows marked **Needs Review**. Correct co
 4. When the report is correct, disable dry run and run again to create new photos.
 
 Source photos are not modified. By default, the tool only fills missing metadata. Replacing existing EXIF fields should be enabled only when necessary.
+
+#### Write Options
+
+| Option | Description |
+| --- | --- |
+| Dry run only | Validate the reviewed workbook and create a report without creating new photos. Keep this enabled for the first run. |
+| Replace existing EXIF | Allow reviewed GPS or capture-time values to replace existing metadata. Files are still written to a new output folder. |
 
 ## Outputs
 
@@ -73,6 +94,14 @@ If a task is interrupted, run it again with the same photo folder and workbook p
 - Never choose the source photo folder as the output folder.
 - Use local OCR for sensitive photos, or confirm that the chosen API meets your data-handling requirements.
 - OCR and model output can be wrong; complete the necessary human review before archival use.
+
+## Troubleshooting
+
+### “Umi-OCR local API did not become ready”
+
+Download the Windows portable package from GitHub Releases and extract the complete ZIP before starting the application. Do not run the EXE from inside the ZIP preview and do not copy only the two EXE files. The `runtime` folder must remain beside `PhotoMetadataTool.exe`.
+
+Version `v1.0.0` started Umi-OCR from the wrong working directory. Upgrade to `v1.0.1` or later. If a newer version still fails, check whether security software blocked `Umi-OCR.exe` under `runtime`, or whether another application is using local port `1224`.
 
 ## Supported Systems and Files
 

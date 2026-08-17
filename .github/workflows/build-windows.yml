@@ -21,6 +21,24 @@ jobs:
       - name: Build portable package
         shell: powershell
         run: ./build_portable.ps1
+      - name: Smoke test packaged local OCR
+        shell: powershell
+        run: |
+          $testDir = Join-Path $env:RUNNER_TEMP 'photo-metadata-ocr-smoke'
+          New-Item -ItemType Directory -Path $testDir -Force | Out-Null
+          $sampleImage = Join-Path $testDir 'sample.png'
+          $reviewWorkbook = Join-Path $testDir 'review.xlsx'
+          & ./.venv/Scripts/python.exe -c "import sys; from PIL import Image, ImageDraw; image=Image.new('RGB',(1200,500),'white'); draw=ImageDraw.Draw(image); draw.text((50,120),'Longitude 120.123456  Latitude 31.234567',(0,0,0)); draw.text((50,240),'2026-08-17 15:30:00',(0,0,0)); image.save(sys.argv[1])" $sampleImage
+          & ./dist/PhotoMetadataTool/PhotoMetadataWorker.exe review `
+            --image-root $testDir `
+            --review-xlsx $reviewWorkbook `
+            --llm-provider none `
+            --max-images 1 `
+            --excel-image-mode none `
+            --no-group-consistency
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $reviewWorkbook)) {
+            throw 'Packaged local OCR smoke test failed.'
+          }
       - name: Upload package
         uses: actions/upload-artifact@v7
         with:
