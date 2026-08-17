@@ -389,6 +389,15 @@ def start_umi_server(executable, endpoint, timeout):
         "cwd": executable_dir,
         "shell": False,
     }
+    if os.name == "nt":
+        # Umi-OCR must not inherit the worker's redirected console handles.
+        # A separate hidden console keeps its standard streams valid while the
+        # GUI continues to capture this worker's progress output.
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+        kwargs["startupinfo"] = startupinfo
+        kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
     process = subprocess.Popen(command, **kwargs)
     startup_timeout = max(30.0, min(float(timeout), 120.0))
     deadline = time.time() + startup_timeout
