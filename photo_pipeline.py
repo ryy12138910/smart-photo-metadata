@@ -1963,6 +1963,15 @@ def write_review(args):
 
 
 def main(argv=None):
+    # The GUI reads worker logs as UTF-8. Explicitly configure the streams so
+    # English Windows installations do not crash when a progress line contains
+    # Chinese text (their default console encoding is commonly cp1252).
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (AttributeError, OSError):
+                pass
     parser = build_parser()
     args = parser.parse_args(argv)
     if not args.command:
