@@ -1331,6 +1331,25 @@ def review_datetime_has_clock(value):
     )
 
 
+def review_datetime_for_exif(value):
+    """Return a writable EXIF datetime and whether midnight was supplied."""
+    text = clean_cell(value)
+    if not text or review_datetime_has_clock(text):
+        return text, False
+    match = re.search(
+        r"(?<!\d)((?:19|20)\d{2})[-:/\.]([01]?\d)[-:/\.]([0-3]?\d)(?!\d)",
+        text,
+    )
+    if not match:
+        return text, False
+    year, month, day = [int(part) for part in match.groups()]
+    try:
+        date_value = datetime(year, month, day)
+    except ValueError:
+        return text, False
+    return date_value.strftime("%Y:%m:%d 00:00:00"), True
+
+
 def write_exif_from_review(args):
     image_root = os.path.abspath(args.image_root)
     output_dir = os.path.abspath(args.output_dir)
@@ -1405,9 +1424,16 @@ def write_exif_from_review(args):
                 continue
 
             shooting_time = clean_cell(row.get(L_TIME))
+            shooting_time_for_write, date_only_midnight = review_datetime_for_exif(
+                shooting_time
+            )
             has_date = bool(shooting_time)
             has_time = bool(
-                shooting_time and review_datetime_has_clock(shooting_time)
+                shooting_time
+                and (
+                    review_datetime_has_clock(shooting_time)
+                    or date_only_midnight
+                )
             )
             has_latlon = bool(lat_text and lon_text)
             if not has_latlon and not has_date:
@@ -1442,9 +1468,14 @@ def write_exif_from_review(args):
             write_latlon = plan["write_latlon"]
             write_time = plan["write_time"]
             preserved = []
-            if has_date and not has_time:
+            warnings = []
+            if date_only_midnight and write_time:
+                warnings.append(
+                    "date-only review value; wrote 00:00:00 as the clock time"
+                )
+            elif date_only_midnight:
                 preserved.append(
-                    "date-only review value (EXIF datetime not written without clock time)"
+                    "date-only review value (would use 00:00:00)"
                 )
             if has_latlon and existing_has_gps and not overwrite_existing:
                 preserved.append("existing GPS")
@@ -1475,7 +1506,7 @@ def write_exif_from_review(args):
                         lat,
                         lon,
                         in_place=True,
-                        datetime_original=shooting_time if write_time else None,
+                        datetime_original=shooting_time_for_write if write_time else None,
                     )
                 else:
                     dst_path = output_path_for_review_image(image_path, image_root, output_dir)
@@ -1484,14 +1515,22 @@ def write_exif_from_review(args):
                         lat,
                         lon,
                         in_place=True,
-                        datetime_original=shooting_time if write_time else None,
+                        datetime_original=shooting_time_for_write if write_time else None,
                     )
             elif image_ext in JPG_EXTENSIONS and write_time:
                 if args.in_place:
-                    output_path = write_datetime_exif(image_path, in_place=True, datetime_original=shooting_time)
+                    output_path = write_datetime_exif(
+                        image_path,
+                        in_place=True,
+                        datetime_original=shooting_time_for_write,
+                    )
                 else:
                     dst_path = output_path_for_review_image(image_path, image_root, output_dir)
-                    output_path = write_datetime_exif(dst_path, in_place=True, datetime_original=shooting_time)
+                    output_path = write_datetime_exif(
+                        dst_path,
+                        in_place=True,
+                        datetime_original=shooting_time_for_write,
+                    )
             elif image_ext == ".png":
                 if args.in_place:
                     output_path = write_png_exif(
@@ -1499,7 +1538,7 @@ def write_exif_from_review(args):
                         lat=lat if write_latlon else None,
                         lon=lon if write_latlon else None,
                         in_place=True,
-                        datetime_original=shooting_time if write_time else None,
+                        datetime_original=shooting_time_for_write if write_time else None,
                     )
                 else:
                     dst_path = output_path_for_review_image(image_path, image_root, output_dir)
@@ -1508,7 +1547,7 @@ def write_exif_from_review(args):
                         lat=lat if write_latlon else None,
                         lon=lon if write_latlon else None,
                         in_place=True,
-                        datetime_original=shooting_time if write_time else None,
+                        datetime_original=shooting_time_for_write if write_time else None,
                     )
             elif args.in_place:
                 output_path = image_path
@@ -1523,13 +1562,15 @@ def write_exif_from_review(args):
                 actions.append("wrote shooting datetime")
             if preserved:
                 actions.append("preserved " + ", ".join(preserved))
+            if warnings:
+                actions.append("warning: " + ", ".join(warnings))
             report["reason"] = "; ".join(actions)
             report["output_image_path"] = output_path
             if write_latlon:
                 report["written_lat"] = "%.8f" % lat
                 report["written_lon"] = "%.8f" % lon
             if write_time:
-                report["written_shooting_datetime"] = shooting_time
+                report["written_shooting_datetime"] = shooting_time_for_write
             if output_path and not output_path.startswith("("):
                 report.update(read_exif_summary(output_path))
             total_ok += 1

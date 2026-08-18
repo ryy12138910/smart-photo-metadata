@@ -28,11 +28,31 @@ DEFAULT_OUTPUT_DIR = PROJECT_DIR / "outputs"
 DEFAULT_REVIEW_XLSX = DEFAULT_OUTPUT_DIR / "metadata_review.xlsx"
 DEFAULT_PHOTO_OUTPUT = DEFAULT_OUTPUT_DIR / "photos_with_exif"
 DEFAULT_API_ENDPOINT = "https://api.openai.com/v1/chat/completions"
-DEFAULT_API_MODEL = ""
+DEFAULT_API_MODEL = "gpt-4o-mini"
+
+API_PROVIDER_PRESETS = {
+    "openai": {
+        "endpoint": DEFAULT_API_ENDPOINT,
+        "model": DEFAULT_API_MODEL,
+    },
+    "qwen": {
+        "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        "model": "qwen3-vl-plus",
+    },
+    "custom": {
+        "endpoint": "",
+        "model": "",
+    },
+}
 
 ZH_MODEL_MODE_LABELS = {
     "纯 OCR（本地处理）": ("none", "suspicious"),
     "OCR + 大模型 API": ("openai", "suspicious"),
+}
+ZH_API_PROVIDER_LABELS = {
+    "OpenAI": "openai",
+    "阿里云百炼（千问）": "qwen",
+    "自定义兼容服务": "custom",
 }
 ZH_IMAGE_MODE_LABELS = {
     "不嵌入图片，仅保留链接（最快）": "none",
@@ -60,6 +80,9 @@ TRANSLATIONS = {
     "识别方式": "Recognition Mode",
     "纯 OCR（本地处理）": "OCR Only (Local)",
     "OCR + 大模型 API": "OCR + LLM API",
+    "API 服务商": "API Provider",
+    "阿里云百炼（千问）": "Alibaba Cloud Model Studio (Qwen)",
+    "自定义兼容服务": "Custom Compatible Service",
     "API 地址": "API Endpoint",
     "模型名称": "Model Name",
     "API 复核范围": "API Review Scope",
@@ -301,6 +324,11 @@ class PhotoMetadataApp(tk.Tk):
     def _model_labels(self):
         return {self._(label): value for label, value in ZH_MODEL_MODE_LABELS.items()}
 
+    def _api_provider_labels(self):
+        return {
+            self._(label): value for label, value in ZH_API_PROVIDER_LABELS.items()
+        }
+
     def _image_labels(self):
         return {self._(label): value for label, value in ZH_IMAGE_MODE_LABELS.items()}
 
@@ -316,6 +344,7 @@ class PhotoMetadataApp(tk.Tk):
         self.review_image_root = tk.StringVar(value=str(DEFAULT_DATA_DIR))
         self.review_xlsx = tk.StringVar(value=str(DEFAULT_REVIEW_XLSX))
         self.model_mode = tk.StringVar(value=next(iter(ZH_MODEL_MODE_LABELS)))
+        self.api_provider = tk.StringVar(value=next(iter(ZH_API_PROVIDER_LABELS)))
         self.model_name = tk.StringVar(value=DEFAULT_API_MODEL)
         self.api_endpoint = tk.StringVar(value=DEFAULT_API_ENDPOINT)
         self.api_key = tk.StringVar(value="")
@@ -420,6 +449,9 @@ class PhotoMetadataApp(tk.Tk):
         _image_label, image_value = self._translate_choice(
             self.excel_image_mode.get(), ZH_IMAGE_MODE_LABELS
         )
+        _api_provider_label, api_provider_value = self._translate_choice(
+            self.api_provider.get(), ZH_API_PROVIDER_LABELS
+        )
         current_scope_all = self.api_review_scope.get() in (
             "复核所有缺少属性的图片",
             TRANSLATIONS["复核所有缺少属性的图片"],
@@ -432,6 +464,13 @@ class PhotoMetadataApp(tk.Tk):
         )
         self.excel_image_mode.set(
             next(label for label, value in self._image_labels().items() if value == image_value)
+        )
+        self.api_provider.set(
+            next(
+                label
+                for label, value in self._api_provider_labels().items()
+                if value == api_provider_value
+            )
         )
         self.api_review_scope.set(
             self._("复核所有缺少属性的图片")
@@ -482,9 +521,18 @@ class PhotoMetadataApp(tk.Tk):
         model_combo.grid(row=0, column=1, columnspan=3, sticky="ew", pady=5)
         model_combo.bind("<<ComboboxSelected>>", lambda _event: self._sync_model_state())
 
-        ttk.Label(options, text=self._("API 地址")).grid(row=1, column=0, sticky="w", padx=(0, 10), pady=5)
-        self.api_endpoint_entry = ttk.Entry(options, textvariable=self.api_endpoint)
-        self.api_endpoint_entry.grid(row=1, column=1, columnspan=3, sticky="ew", pady=5)
+        ttk.Label(options, text=self._("API 服务商")).grid(row=1, column=0, sticky="w", padx=(0, 10), pady=5)
+        self.api_provider_combo = ttk.Combobox(
+            options,
+            textvariable=self.api_provider,
+            values=list(self._api_provider_labels()),
+            state="readonly",
+        )
+        self.api_provider_combo.grid(row=1, column=1, columnspan=3, sticky="ew", pady=5)
+        self.api_provider_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _event: self._sync_api_provider(reset_model=True),
+        )
 
         ttk.Label(options, text=self._("模型名称")).grid(row=2, column=0, sticky="w", padx=(0, 10), pady=5)
         self.model_entry = ttk.Entry(options, textvariable=self.model_name)
@@ -494,33 +542,37 @@ class PhotoMetadataApp(tk.Tk):
         self.api_key_entry = ttk.Entry(options, textvariable=self.api_key, show="●")
         self.api_key_entry.grid(row=2, column=3, sticky="ew", pady=5)
 
-        ttk.Label(options, text=self._("API 复核范围")).grid(row=3, column=0, sticky="w", padx=(0, 10), pady=5)
+        ttk.Label(options, text=self._("API 地址")).grid(row=3, column=0, sticky="w", padx=(0, 10), pady=5)
+        self.api_endpoint_entry = ttk.Entry(options, textvariable=self.api_endpoint)
+        self.api_endpoint_entry.grid(row=3, column=1, columnspan=3, sticky="ew", pady=5)
+
+        ttk.Label(options, text=self._("API 复核范围")).grid(row=4, column=0, sticky="w", padx=(0, 10), pady=5)
         self.api_scope_combo = ttk.Combobox(
             options,
             textvariable=self.api_review_scope,
             values=[self._("仅复核异常结果"), self._("复核所有缺少属性的图片")],
             state="readonly",
         )
-        self.api_scope_combo.grid(row=3, column=1, sticky="ew", pady=5)
+        self.api_scope_combo.grid(row=4, column=1, sticky="ew", pady=5)
 
-        ttk.Label(options, text=self._("审核表图片")).grid(row=3, column=2, sticky="w", padx=(18, 10), pady=5)
+        ttk.Label(options, text=self._("审核表图片")).grid(row=4, column=2, sticky="w", padx=(18, 10), pady=5)
         ttk.Combobox(
             options,
             textvariable=self.excel_image_mode,
             values=list(self._image_labels()),
             state="readonly",
-        ).grid(row=3, column=3, sticky="ew", pady=5)
+        ).grid(row=4, column=3, sticky="ew", pady=5)
 
-        ttk.Label(options, text=self._("路径筛选")).grid(row=4, column=0, sticky="w", padx=(0, 10), pady=5)
-        ttk.Entry(options, textvariable=self.path_contains).grid(row=4, column=1, sticky="ew", pady=5)
-        ttk.Label(options, text=self._("处理数量上限")).grid(row=4, column=2, sticky="w", padx=(18, 10), pady=5)
-        ttk.Entry(options, textvariable=self.max_images, width=12).grid(row=4, column=3, sticky="ew", pady=5)
+        ttk.Label(options, text=self._("路径筛选")).grid(row=5, column=0, sticky="w", padx=(0, 10), pady=5)
+        ttk.Entry(options, textvariable=self.path_contains).grid(row=5, column=1, sticky="ew", pady=5)
+        ttk.Label(options, text=self._("处理数量上限")).grid(row=5, column=2, sticky="w", padx=(18, 10), pady=5)
+        ttk.Entry(options, textvariable=self.max_images, width=12).grid(row=5, column=3, sticky="ew", pady=5)
 
         ttk.Label(options, text=self._("同目录离群阈值（米）")).grid(
-            row=5, column=0, sticky="w", padx=(0, 10), pady=5
+            row=6, column=0, sticky="w", padx=(0, 10), pady=5
         )
         ttk.Entry(options, textvariable=self.group_threshold).grid(
-            row=5, column=1, sticky="ew", pady=5
+            row=6, column=1, sticky="ew", pady=5
         )
         self._sync_model_state()
 
@@ -642,11 +694,46 @@ class PhotoMetadataApp(tk.Tk):
 
     def _sync_model_state(self):
         provider, _mode = self._model_labels()[self.model_mode.get()]
-        state = "normal" if provider == "openai" else "disabled"
-        self.model_entry.configure(state=state)
-        self.api_endpoint_entry.configure(state=state)
-        self.api_key_entry.configure(state=state)
-        self.api_scope_combo.configure(state="readonly" if provider == "openai" else "disabled")
+        api_enabled = provider == "openai"
+        self.api_provider_combo.configure(
+            state="readonly" if api_enabled else "disabled"
+        )
+        self.model_entry.configure(state="normal" if api_enabled else "disabled")
+        self.api_key_entry.configure(state="normal" if api_enabled else "disabled")
+        self.api_scope_combo.configure(
+            state="readonly" if api_enabled else "disabled"
+        )
+        self._sync_api_provider(reset_model=False)
+
+    def _sync_api_provider(self, reset_model=False):
+        model_provider, _mode = self._model_labels()[self.model_mode.get()]
+        api_enabled = model_provider == "openai"
+        preset_name = self._api_provider_labels().get(
+            self.api_provider.get(), "openai"
+        )
+        preset = API_PROVIDER_PRESETS[preset_name]
+
+        if api_enabled and preset_name != "custom":
+            self.api_endpoint.set(preset["endpoint"])
+        elif api_enabled and reset_model:
+            known_endpoints = {
+                item["endpoint"]
+                for item in API_PROVIDER_PRESETS.values()
+                if item["endpoint"]
+            }
+            if self.api_endpoint.get().strip() in known_endpoints:
+                self.api_endpoint.set("")
+
+        if api_enabled and (reset_model or not self.model_name.get().strip()):
+            self.model_name.set(preset["model"])
+
+        if not api_enabled:
+            endpoint_state = "disabled"
+        elif preset_name == "custom":
+            endpoint_state = "normal"
+        else:
+            endpoint_state = "readonly"
+        self.api_endpoint_entry.configure(state=endpoint_state)
 
     def _choose_directory(self, variable, allow_new=False):
         current = variable.get().strip()

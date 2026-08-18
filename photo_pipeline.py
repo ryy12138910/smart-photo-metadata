@@ -40,7 +40,7 @@ import metadata_workbook as core
 from exif_utils import validate_lat_lon
 
 
-PIPELINE_VERSION = 3
+PIPELINE_VERSION = 4
 PROMPT_VERSION = 5
 DEFAULT_UMI_ENDPOINT = "http://127.0.0.1:1224/api/ocr"
 DEFAULT_OCR_LIMIT_SIDE_LEN = 960
@@ -909,6 +909,7 @@ def review_result_cache_key(args):
         "prompt": PROMPT_VERSION,
         "provider": args.llm_provider,
         "model": args.llm_model,
+        "endpoint": clean(args.llm_endpoint),
         "review_mode": args.llm_review_mode,
         "llm_min_confidence": args.llm_min_confidence,
         "auto_approve_threshold": args.auto_approve_threshold,
@@ -1493,10 +1494,11 @@ def create_review(args):
         "ocr_error": 0,
         "model_error": 0,
     }
-    model_cache_key = "%s:%s:%s" % (
+    model_cache_key = "%s:%s:%s:%s" % (
         PROMPT_VERSION,
         args.llm_provider,
         model_descriptor,
+        clean(args.llm_endpoint),
     )
     result_cache_key = review_result_cache_key(args)
     prepared_items = []

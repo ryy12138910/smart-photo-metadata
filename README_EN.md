@@ -41,7 +41,7 @@ Source mode is intended for developers who need to modify the program. It requir
 1. Choose the photo root folder.
 2. Choose where to save the review workbook.
 3. Select OCR Only or OCR + LLM API.
-4. When using an API, enter the complete endpoint, model name, and API key.
+4. When using an API, select the provider and enter the model name and API key.
 5. Select **Create Review Workbook**.
 
 The selected model must support image input. The API key is supplied only to the current task and is not written to the workbook, cache, or log.
@@ -53,10 +53,13 @@ Open the completed workbook and inspect rows marked **Needs Review**. Correct co
 | Option | Description |
 | --- | --- |
 | Recognition Mode | OCR Only runs entirely on the computer. OCR + LLM API sends photos that need review to the configured API. |
-| API Endpoint | The complete image-chat endpoint supplied by the provider. Used only in LLM API mode. |
+| API Provider | OpenAI and Alibaba Cloud Model Studio (Qwen) configure their endpoints automatically. Choose Custom Compatible Service for another provider. |
+| API Endpoint | No input is needed for OpenAI or Qwen. For a custom compatible service, enter the complete image-chat endpoint supplied by that provider. |
 | Model Name | The provider's model identifier. The selected model must support image input. |
 | API Key | The credential used for the current model task. The application does not save it. |
 | API Review Scope | Review Exceptions Only reduces API calls. Review All Photos with Missing Metadata is more comprehensive but may increase usage and cost. |
+
+The Alibaba Cloud Model Studio (Qwen) preset uses the public China (Beijing) compatible endpoint. Select Custom Compatible Service for another region or a workspace-specific endpoint.
 | Workbook Images | Keep links only, embed compressed thumbnails, or embed original photos. Embedding originals can make the workbook very large. |
 | Path Filter | Process only photos whose full path contains this text. Leave it blank to process every supported photo under the selected root folder. |
 | Photo Limit | Maximum number of photos for this run. Enter `0` for no limit. This is useful for a small pilot run. |
@@ -77,6 +80,8 @@ Source photos are not modified. By default, the tool only fills missing metadata
 | --- | --- |
 | Dry run only | Validate the reviewed workbook and create a report without creating new photos. Keep this enabled for the first run. |
 | Replace existing EXIF | Allow reviewed GPS or capture-time values to replace existing metadata. Files are still written to a new output folder. |
+
+If the reviewed capture time contains a date only, the application writes `00:00:00` as its clock time and records a warning in `write_result_report.xlsx`. Existing capture time is still preserved unless EXIF replacement is enabled.
 
 ## Outputs
 
